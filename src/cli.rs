@@ -72,9 +72,9 @@ impl Screen {
             Screen::Add => {
                 "Type to edit · Tab / ↑ / ↓ switches fields · Enter to save · Esc to go back"
             }
-            Screen::Search => "Type to filter · Enter to search · Esc to go back",
+            Screen::Search => "Type to filter · ↑ / ↓ select · Enter view details · Esc to go back",
             Screen::List => "↑ / ↓ Navigate · Enter View details · r Refresh · Esc Back",
-            Screen::Details => "↑ / ↓ scroll · Esc back to list · Esc again for menu",
+            Screen::Details => "↑ / ↓ Scroll · c Copy secret · Esc Back · q Menu",
             Screen::Update => {
                 "Type to edit · Tab / ↑ / ↓ switches fields · Enter to save · Esc to go back"
             }
@@ -145,7 +145,10 @@ struct Dashboard {
     form: Form,
     credentials: Vec<Credential>,
     selected_credential: usize,
+    search_selected: usize,
     details_offset: usize,
+    details_origin: Screen,
+    copy_requested: bool,
 }
 
 impl Dashboard {
@@ -157,7 +160,10 @@ impl Dashboard {
             form: Form::new(&[]),
             credentials: Vec::new(),
             selected_credential: 0,
+            search_selected: 0,
             details_offset: 0,
+            details_origin: Screen::List,
+            copy_requested: false,
         }
     }
 
@@ -166,6 +172,7 @@ impl Dashboard {
             Ok(credentials) => {
                 self.credentials = credentials;
                 self.selected_credential = 0;
+                self.search_selected = 0;
                 true
             }
             Err(error) => {
@@ -189,6 +196,10 @@ impl Dashboard {
         let loaded = matches!(screen, Screen::List | Screen::Search | Screen::Rotate)
             && self.load_credentials();
 
+        if screen == Screen::Search {
+            self.search_selected = 0;
+        }
+
         if screen == Screen::List && loaded {
             self.status = format!(
                 "Successfully loaded {} credentials from Notion.",
@@ -204,11 +215,12 @@ impl Dashboard {
         self.form = Form::new(&[]);
     }
 
-    fn search_matches(&self) -> Vec<&Credential> {
+    fn search_indices(&self) -> Vec<usize> {
         let query = self.form.value(0).trim().to_lowercase();
         self.credentials
             .iter()
-            .filter(|credential| {
+            .enumerate()
+            .filter(|(_, credential)| {
                 query.is_empty()
                     || credential.name.to_lowercase().contains(&query)
                     || credential
@@ -220,7 +232,27 @@ impl Dashboard {
                         .as_deref()
                         .is_some_and(|username| username.to_lowercase().contains(&query))
             })
+            .map(|(index, _)| index)
             .collect()
+    }
+
+    fn search_matches(&self) -> Vec<&Credential> {
+        self.search_indices()
+            .into_iter()
+            .filter_map(|index| self.credentials.get(index))
+            .collect()
+    }
+
+    fn select_search_result(&mut self, delta: isize) {
+        let indices = self.search_indices();
+        if indices.is_empty() {
+            return;
+        }
+        let last = indices.len() - 1;
+        let next = (self.search_selected as isize + delta).clamp(0, last as isize) as usize;
+        self.search_selected = next;
+        let index = indices[next];
+        self.status = format!("Selected: {}", self.credentials[index].name);
     }
 
     fn select_credential(&mut self, delta: isize) {
@@ -233,16 +265,52 @@ impl Dashboard {
         self.status = format!("Selected: {}", self.credentials[next].name);
     }
 
+    fn take_copy_request(&mut self) -> bool {
+        std::mem::take(&mut self.copy_requested)
+    }
+
+    fn copy_selected_secret(&mut self) {
+        let Some(credential) = self.credentials.get(self.selected_credential) else {
+            self.status = "No credential selected.".to_string();
+            return;
+        };
+
+        let reference = credential
+            .credential_reference
+            .as_deref()
+            .map(str::trim)
+            .filter(|reference| !reference.is_empty());
+
+        let Some(reference) = reference else {
+            self.status = "No 1Password reference configured for this credential.".to_string();
+            return;
+        };
+
+        match crate::onepassword::client::copy_secret_to_clipboard(reference) {
+            Ok(()) => self.status = "Secret copied to clipboard.".to_string(),
+            Err(_) => {
+                self.status = "Could not copy the credential to the clipboard.".to_string();
+            }
+        }
+    }
+
     fn submit(&mut self) {
         match self.screen {
             Screen::Menu => {}
             Screen::Search => {
-                let count = self.search_matches().len();
-                self.status = if count == 0 {
-                    "No credentials match that query.".to_string()
-                } else {
-                    format!("Found {count} matching credential(s).")
-                };
+                let indices = self.search_indices();
+                if indices.is_empty() {
+                    self.status = "No credentials match that query.".to_string();
+                    return;
+                }
+                let position = self.search_selected.min(indices.len() - 1);
+                let index = indices[position];
+                self.search_selected = position;
+                self.selected_credential = index;
+                self.details_offset = 0;
+                self.details_origin = Screen::Search;
+                self.screen = Screen::Details;
+                self.status = Screen::Details.hint().to_string();
             }
             Screen::List => {
                 if self.credentials.is_empty() {
@@ -251,8 +319,9 @@ impl Dashboard {
                     let index = self.selected_credential.min(self.credentials.len() - 1);
                     self.selected_credential = index;
                     self.details_offset = 0;
+                    self.details_origin = Screen::List;
                     self.screen = Screen::Details;
-                    self.status = format!("Viewing credential: {}", self.credentials[index].name);
+                    self.status = Screen::Details.hint().to_string();
                 }
             }
             Screen::Add => {
@@ -308,8 +377,11 @@ impl Dashboard {
         match code {
             KeyCode::Esc => {
                 if self.screen == Screen::Details {
-                    self.screen = Screen::List;
-                    self.status = Screen::List.hint().to_string();
+                    self.screen = match self.details_origin {
+                        Screen::Search => Screen::Search,
+                        _ => Screen::List,
+                    };
+                    self.status = self.screen.hint().to_string();
                 } else {
                     self.back_to_menu();
                     self.status = Screen::Menu.hint().to_string();
@@ -326,7 +398,9 @@ impl Dashboard {
                 }
             }
             KeyCode::Up => {
-                if self.screen.is_form() {
+                if self.screen == Screen::Search {
+                    self.select_search_result(-1);
+                } else if self.screen.is_form() {
                     self.form.previous();
                 } else if self.screen == Screen::Details {
                     self.details_offset = self.details_offset.saturating_sub(1);
@@ -335,7 +409,9 @@ impl Dashboard {
                 }
             }
             KeyCode::Down => {
-                if self.screen.is_form() {
+                if self.screen == Screen::Search {
+                    self.select_search_result(1);
+                } else if self.screen.is_form() {
                     self.form.next();
                 } else if self.screen == Screen::Details {
                     self.details_offset += 1;
@@ -346,11 +422,17 @@ impl Dashboard {
             KeyCode::Backspace => {
                 if self.screen.is_form() {
                     self.form.backspace();
+                    if self.screen == Screen::Search {
+                        self.search_selected = 0;
+                    }
                 }
             }
             KeyCode::Char(character) => {
                 if self.screen.is_form() {
                     self.form.push(character);
+                    if self.screen == Screen::Search {
+                        self.search_selected = 0;
+                    }
                 } else if self.screen == Screen::List && (character == 'r' || character == 'R') {
                     if self.load_credentials() {
                         self.status = format!(
@@ -358,6 +440,8 @@ impl Dashboard {
                             self.credentials.len()
                         );
                     }
+                } else if self.screen == Screen::Details && (character == 'c' || character == 'C') {
+                    self.copy_requested = true;
                 } else if character == 'q' || character == 'Q' {
                     self.back_to_menu();
                     self.status = Screen::Menu.hint().to_string();
@@ -502,34 +586,52 @@ impl Dashboard {
     }
 
     fn render_search(&self, frame: &mut Frame, area: Rect) {
-        let mut lines = form_lines(&self.form, usize::MAX);
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  RESULTS",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )));
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(4), Constraint::Min(3)])
+            .split(area);
 
-        let matches = self.search_matches();
-        if matches.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "  No credentials found.",
-                Style::default().fg(MUTED),
-            )));
-        } else {
-            for credential in matches {
-                let service = credential.service.as_deref().unwrap_or("—");
-                lines.push(Line::from(Span::styled(
-                    format!("  {}  ({service})", credential.name),
-                    Style::default().fg(TEXT),
-                )));
-            }
-        }
+        let query_line = Line::from(vec![
+            Span::styled(
+                "  Query  ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                self.form.value(0).to_string(),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("▌", Style::default().fg(ACCENT)),
+        ]);
+        let note = Line::from(Span::styled(
+            "  Filters as you type · ↑ / ↓ select · Enter view details",
+            Style::default().fg(MUTED),
+        ));
 
         frame.render_widget(
-            Paragraph::new(lines)
+            Paragraph::new(vec![query_line, note])
                 .style(Style::default().bg(PANEL_BG))
                 .block(panel(self.screen.title())),
-            area,
+            sections[0],
+        );
+
+        let matches = self.search_matches();
+        let selected = if matches.is_empty() {
+            0
+        } else {
+            self.search_selected.min(matches.len() - 1)
+        };
+        let items = matches
+            .iter()
+            .map(|credential| credential_item(credential))
+            .collect();
+
+        render_selectable_list(
+            frame,
+            sections[1],
+            "RESULTS",
+            items,
+            selected,
+            Some("No credentials match that query."),
         );
     }
 
@@ -665,6 +767,21 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     result
 }
 
+fn suspend_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    Ok(())
+}
+
+fn resume_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+    enable_raw_mode()?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    terminal.hide_cursor()?;
+    terminal.clear()?;
+    Ok(())
+}
+
 fn show_dashboard(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -680,6 +797,13 @@ fn show_dashboard(
 
             if dashboard.handle_key(key.code) {
                 break;
+            }
+
+            if dashboard.take_copy_request() {
+                suspend_tui(terminal)?;
+                dashboard.copy_selected_secret();
+                resume_tui(terminal)?;
+                terminal.draw(|frame| dashboard.render(frame))?;
             }
         }
     }
@@ -837,32 +961,31 @@ fn truncate(value: &str, max: usize) -> String {
 }
 
 fn credential_items(credentials: &[Credential]) -> Vec<ListItem<'static>> {
-    credentials
-        .iter()
-        .map(|credential| {
-            let status = credential.status.as_deref().unwrap_or("Unknown");
-            let environment = credential.environment.as_deref().unwrap_or("—");
+    credentials.iter().map(credential_item).collect()
+}
 
-            let status_style = match status.to_lowercase().as_str() {
-                "active" => Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                "inactive" => Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-                "revoked" => Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
-                _ => Style::default().fg(MUTED),
-            };
+fn credential_item(credential: &Credential) -> ListItem<'static> {
+    let status = credential.status.as_deref().unwrap_or("Unknown");
+    let environment = credential.environment.as_deref().unwrap_or("—");
 
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("  {:<32}", truncate(&credential.name, 32)),
-                    Style::default().fg(TEXT),
-                ),
-                Span::styled(format!("[{:<10}]", status.to_uppercase()), status_style),
-                Span::styled(
-                    format!("  {:<14}", truncate(environment, 14)),
-                    Style::default().fg(MUTED),
-                ),
-            ]))
-        })
-        .collect()
+    let status_style = match status.to_lowercase().as_str() {
+        "active" => Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        "inactive" => Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        "revoked" => Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+        _ => Style::default().fg(MUTED),
+    };
+
+    ListItem::new(Line::from(vec![
+        Span::styled(
+            format!("  {:<32}", truncate(&credential.name, 32)),
+            Style::default().fg(TEXT),
+        ),
+        Span::styled(format!("[{:<10}]", status.to_uppercase()), status_style),
+        Span::styled(
+            format!("  {:<14}", truncate(environment, 14)),
+            Style::default().fg(MUTED),
+        ),
+    ]))
 }
 
 fn form_lines(form: &Form, visible_rows: usize) -> Vec<Line<'static>> {
