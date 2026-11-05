@@ -98,9 +98,27 @@ Notes:
 2. Open the `•••` menu → **Connections** → **Connect to** → select your integration.
 3. Confirm the integration can access the database.
 
-## 3. Get the data source ID
+## 3. Configure the application to use the new database
 
-This project uses Notion API version `2025-09-03`, where pages live under a **data source**, not directly under a database. The app expects `NOTION_DATA_SOURCE_ID` — the data source ID, not the database page ID.
+The app reads from two separate stores:
+
+| Store | What it holds | Configured by |
+| --- | --- | --- |
+| Notion | Credential metadata | `NOTION_DATA_SOURCE_ID` |
+| Local SQLite | Secret values and the Notion API key | `DB_PATH` |
+
+Nothing in Notion points at the database you just built until you complete this section.
+
+### Clone the repository
+
+```bash
+git clone https://github.com/Datanerdbytes/quantumdata-credential-manager.git
+cd quantumdata-credential-manager
+```
+
+### Get the Notion data source ID
+
+This project uses Notion API version `2025-09-03`, where pages live under a **data source**, not directly under a database. The app expects the data source ID, not the database page ID.
 
 With the database shared to your integration, fetch its data sources:
 
@@ -111,50 +129,56 @@ export DATABASE_ID="the_32_character_database_id_from_the_notion_url"
 curl -s "https://api.notion.com/v1/databases/${DATABASE_ID}" \
   -H "Authorization: Bearer ${NOTION_TOKEN}" \
   -H "Notion-Version: 2025-09-03" \
-  | jq '.data_sources'
+  | jq '.data_sources[] | {id, name}'
 ```
 
-Copy the `id` of the first data source. If `data_sources` is empty or the request returns `object_not_found`, the database has not been shared with the integration yet.
+Copy the `id` that belongs to the database you created in step 2. If you only have one, use the first entry. If `data_sources` is empty or the request returns `object_not_found`, the database has not been shared with the integration yet.
 
-## 4. Configure the app
+> Do not put the database page ID from the Notion URL into `NOTION_DATA_SOURCE_ID`. That ID is only used in the `curl` command above; the app needs the `data_sources[].id`.
 
-Clone the repository and enter it:
-
-```bash
-git clone https://github.com/Datanerdbytes/quantumdata-credential-manager.git
-cd quantumdata-credential-manager
-```
-
-Create your local environment file:
+### Create the `.env` file
 
 ```bash
 cp .env.example .env
+mkdir -p data
 ```
 
-Edit `.env`:
+Edit `.env` and point the app at the new data source and local database:
 
 ```dotenv
-# Required: Notion data source ID from step 3
+# Required: data source ID from the previous step
 NOTION_DATA_SOURCE_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 
-# Optional but recommended: absolute path so every launch uses the same database
-DB_PATH=/absolute/path/to/notion-api-credential-manager/data/credentials.db
+# Optional but recommended: absolute path so every launch uses the same SQLite file
+DB_PATH=/absolute/path/to/quantumdata-credential-manager/data/credentials.db
 ```
 
 Notes:
 
 - The app loads `.env` from the current directory or one of its parents via `dotenvy`. Run it from the project directory, or export the variables in your shell.
-- `DB_PATH` defaults to `credentials.db` in the current working directory. Use an absolute path to avoid accidentally creating a second database when launching from a different folder.
+- `DB_PATH` is the **local SQLite file**, not a Notion database. It defaults to `credentials.db` in the current working directory; use an absolute path to avoid accidentally creating a second store when launching from another folder.
 - `NOTION_DATABASE_ID`, `NOTION_API_KEY_OP_REF`, and `ONEPASSWORD_VAULT` are legacy 1Password-era variables and are not used.
 - `.env`, `data/`, and `credentials.db` are gitignored. Never commit them.
 
-Create the data directory if it does not exist:
+### Store the token and verify the connection
 
-```bash
-mkdir -p data
-```
+The integration token is not read from `.env`. It is stored in the SQLite `meta` table through the app:
 
-## 5. Build and run
+1. Start the app (see [Build and run](#4-build-and-run)).
+2. Choose **Store Notion API Key** and paste the integration token.
+3. Choose **List Credentials**.
+
+The status line should read `Successfully loaded N credentials from Notion.` — `N` is `0` for a brand-new database. If you see an authentication or `object_not_found` error, revisit the integration permissions and the data source ID.
+
+### Switch to a different Notion database later
+
+1. Get the new data source ID with the same `curl` command.
+2. Update `NOTION_DATA_SOURCE_ID` in `.env`.
+3. Restart the app.
+
+If the new Notion database should use its own set of local secrets, also point `DB_PATH` at a different SQLite file. Otherwise the existing local secrets remain available through their `sqlite://<uuid>` references.
+
+## 4. Build and run
 
 Run directly from the source tree:
 
@@ -174,8 +198,9 @@ api-manager
 On first launch:
 
 1. Wait for the QuantumData splash, or press any key to skip it.
-2. Choose **Store Notion API Key** and paste the integration token.
-3. Choose **Add Credential** to create your first entry.
+2. Choose **Store Notion API Key** if you have not stored the token yet.
+3. Choose **List Credentials** to confirm the data source is reachable.
+4. Choose **Add Credential** to create your first entry.
 
 ## Usage
 
