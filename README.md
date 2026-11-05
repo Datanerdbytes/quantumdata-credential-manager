@@ -60,23 +60,39 @@ Each Notion entry stores a `Credential Reference` such as `sqlite://<uuid>`. The
 
 ## 2. Prepare the Notion database
 
-Create a database (or use an existing one) with these property names and types. Property names must match exactly.
+The app does not create the database for you. Build it once in Notion, then share it with the integration. Property names are matched exactly; extra properties are ignored.
 
-| Property | Type | Notes |
+### Create the database
+
+1. In Notion, create a new page and choose **Database → Full page** (an inline database also works). Name it something like `API Credentials`.
+2. Rename the default title property to `Name`.
+3. Use the `+` button in the table header to add each property from the schema below, choosing the matching Notion type.
+4. For the two `Date` properties, turn **Include time** off.
+
+### Property schema
+
+| Property | Notion type | Notes |
 | --- | --- | --- |
 | `Name` | Title | Credential display name |
-| `Status` | Select | The app writes `Active` when creating a credential |
-| `Purpose` | Rich text | What the credential is for |
-| `Credential Reference` | Rich text | Set automatically, e.g. `sqlite://<uuid>` |
-| `Environment Variable` | Rich text | e.g. `OPENAI_API_KEY` |
-| `Environment` | Select | e.g. `Local`, `Production` |
-| `Repository` | Rich text | e.g. `owner/repo` |
-| `Owner` | Rich text | Person or team responsible |
-| `Rotation Frequency` | Select | e.g. `Every 90 days` |
-| `Last Rotated` | Date | `YYYY-MM-DD` |
-| `Next Rotation Due` | Date | `YYYY-MM-DD` |
+| `Status` | Select | The app writes `Active` when creating a credential. Add `Inactive` and `Revoked` if you want to set them manually in Notion. |
+| `Purpose` | Text | What the credential is for. Notion's UI calls it *Text*; the API type is `rich_text`. |
+| `Credential Reference` | Text | Leave empty. The app writes `sqlite://<uuid>` here. |
+| `Environment Variable` | Text | e.g. `OPENAI_API_KEY` |
+| `Environment` | Select | Suggested options: `Local`, `Development`, `Staging`, `Production` |
+| `Repository` | Text | e.g. `owner/repo` |
+| `Owner` | Text | Person or team responsible |
+| `Rotation Frequency` | Select | Suggested options: `Every 30 days`, `Every 90 days`, `Every 180 days`, `Yearly` |
+| `Last Rotated` | Date | `YYYY-MM-DD`, time off |
+| `Next Rotation Due` | Date | `YYYY-MM-DD`, time off |
 
-Then share the database with the integration:
+Notes:
+
+- If a select value you type is not already an option, add that option in Notion first. The app sends the exact text from the form.
+- `Status` is only written on create; use Notion directly to mark a credential `Inactive` or `Revoked`.
+- A wrong property type or a misspelled property name causes a Notion `validation_error`.
+- The app ignores any extra properties you add.
+
+### Share the database with the integration
 
 1. Open the database as a full page in Notion.
 2. Open the `•••` menu → **Connections** → **Connect to** → select your integration.
