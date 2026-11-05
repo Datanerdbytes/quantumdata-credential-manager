@@ -8,11 +8,9 @@ Notion stores the inventory — name, purpose, owner, environment, rotation date
 
 ## Screenshot
 
-<!-- Add a real terminal capture at docs/screenshot.png, then replace this note with:
-![QuantumData terminal UI](docs/screenshot.png)
--->
+![QuantumData terminal UI showing the credential operations menu](docs/screenshot.png)
 
-> **Screenshot placeholder.** Add a capture of the main menu or credential list at `docs/screenshot.png`, then replace this note with `![QuantumData terminal UI](docs/screenshot.png)`.
+*The main menu. Secrets stay in SQLite; Notion stores only metadata.*
 
 ## Features
 
