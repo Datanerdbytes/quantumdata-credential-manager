@@ -1,6 +1,6 @@
-use anyhow::{anyhow, Context, Result, bail};
-use reqwest::blocking::Client;
-use serde_json::Value;
+use anyhow::{Context, Result, anyhow, bail};
+use reqwest::{Method, blocking::Client};
+use serde_json::{Value, json};
 use std::time::Duration;
 
 use crate::config::Settings;
@@ -22,7 +22,9 @@ impl NotionClient {
         let token = database
             .get_notion_api_key()
             .context("Failed to retrieve Notion API key from SQLite database")?
-            .ok_or_else(|| anyhow!("Notion API key not found in database. Run the app to store it first."))?;
+            .ok_or_else(|| {
+                anyhow!("Notion API key not found in database. Run the app to store it first.")
+            })?;
 
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -37,10 +39,10 @@ impl NotionClient {
         })
     }
 
-    fn post_json(&self, url: &str, payload: &Value) -> Result<Value> {
+    fn send_json(&self, method: Method, url: &str, payload: &Value) -> Result<Value> {
         let response = self
             .client
-            .post(url)
+            .request(method, url)
             .bearer_auth(&self.token)
             .header("Notion-Version", NOTION_API_VERSION)
             .json(payload)
@@ -70,6 +72,10 @@ impl NotionClient {
         Ok(body)
     }
 
+    fn post_json(&self, url: &str, payload: &Value) -> Result<Value> {
+        self.send_json(Method::POST, url, payload)
+    }
+
     pub fn query_data_source(&self, start_cursor: Option<&str>) -> Result<Value> {
         let url = format!(
             "{}/data_sources/{}/query",
@@ -90,8 +96,17 @@ impl NotionClient {
     pub fn create_page(&self, properties: &Value) -> Result<Value> {
         let url = format!("{}/pages", NOTION_API_BASE);
         let payload = self.page_payload(properties);
-
         self.post_json(&url, &payload)
+    }
+
+    pub fn update_page(&self, page_id: &str, properties: &Value) -> Result<Value> {
+        let url = format!("{}/pages/{}", NOTION_API_BASE, page_id);
+        self.send_json(Method::PATCH, &url, &update_payload(properties))
+    }
+
+    pub fn archive_page(&self, page_id: &str) -> Result<Value> {
+        let url = format!("{}/pages/{}", NOTION_API_BASE, page_id);
+        self.send_json(Method::PATCH, &url, &archive_payload())
     }
 
     fn page_payload(&self, properties: &Value) -> Value {
@@ -103,6 +118,14 @@ impl NotionClient {
             "properties": properties
         })
     }
+}
+
+fn update_payload(properties: &Value) -> Value {
+    json!({ "properties": properties })
+}
+
+fn archive_payload() -> Value {
+    json!({ "archived": true })
 }
 
 #[cfg(test)]
@@ -153,5 +176,20 @@ mod tests {
         assert!(!serialized.contains(secret));
         assert_eq!(payload.as_object().map(|object| object.len()), Some(2));
         assert_eq!(payload["properties"], properties);
+    }
+
+    #[test]
+    fn update_payload_sends_only_properties() {
+        let properties = properties();
+        let payload = update_payload(&properties);
+
+        assert_eq!(payload, serde_json::json!({ "properties": properties }));
+        assert!(payload.get("archived").is_none());
+        assert_eq!(payload.as_object().map(|object| object.len()), Some(1));
+    }
+
+    #[test]
+    fn archive_payload_trashes_the_page() {
+        assert_eq!(archive_payload(), serde_json::json!({ "archived": true }));
     }
 }

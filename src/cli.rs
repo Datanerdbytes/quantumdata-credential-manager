@@ -1,4 +1,5 @@
 use std::io;
+use std::time::{Duration, Instant};
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -9,21 +10,21 @@ use crossterm::{
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use crate::models::Credential;
-use crate::notion::{NewCredential, create_credential};
+use crate::notion::{NewCredential, archive_credential, create_credential, update_credential};
 use crate::secrets::{Database, SecretItem};
 
 const MENU_ITEMS: [&str; 10] = [
     "Add Credential",
     "Search / Retrieve Credential",
     "List Credentials",
-    "Update Credential Reference",
+    "Update Credential",
     "Register Existing Credential",
     "Rotate Credential",
     "Store Notion API Key",
@@ -32,10 +33,7 @@ const MENU_ITEMS: [&str; 10] = [
     "Exit",
 ];
 
-const ADD_CHOICES: [&str; 2] = [
-    "Create a new credential",
-    "Use an existing credential",
-];
+const ADD_CHOICES: [&str; 2] = ["Create a new credential", "Use an existing credential"];
 
 const ADD_FIELDS: [&str; 9] = [
     "Name",
@@ -51,6 +49,21 @@ const ADD_FIELDS: [&str; 9] = [
 
 const REQUIRED_ADD_FIELDS: usize = 1;
 
+const UPDATE_FIELDS: [&str; 10] = [
+    "Name",
+    "Purpose",
+    "Credential Reference",
+    "Environment Variable",
+    "Environment",
+    "Repository",
+    "Owner",
+    "Rotation Frequency",
+    "Last Rotated",
+    "Next Rotation Due",
+];
+
+const REQUIRED_UPDATE_FIELDS: [usize; 2] = [0, 2];
+
 const BG: Color = Color::Rgb(11, 18, 32);
 const PANEL_BG: Color = Color::Rgb(5, 8, 15);
 const BORDER: Color = Color::Rgb(34, 48, 74);
@@ -63,6 +76,14 @@ const BADGE_ACTIVE_BG: Color = Color::Rgb(18, 40, 28);
 const BADGE_INACTIVE_BG: Color = Color::Rgb(46, 36, 18);
 const BADGE_REVOKED_BG: Color = Color::Rgb(48, 20, 20);
 const SELECT_BG: Color = Color::Rgb(27, 42, 68);
+const SPLASH_COLORS: [Color; 4] = [
+    ACCENT,
+    Color::Rgb(112, 199, 255),
+    Color::Rgb(196, 149, 255),
+    AMBER,
+];
+const SPLASH_DURATION: Duration = Duration::from_millis(1500);
+const SPLASH_FRAME: Duration = Duration::from_millis(45);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -76,6 +97,8 @@ enum Screen {
     List,
     Details,
     Update,
+    UpdateDetails,
+    UpdateSecret,
     Register,
     Rotate,
     SetNotionApiKey,
@@ -95,7 +118,9 @@ impl Screen {
             Screen::Search => "SEARCH / RETRIEVE",
             Screen::List => "CREDENTIALS",
             Screen::Details => "CREDENTIAL DETAILS",
-            Screen::Update => "UPDATE CREDENTIAL REFERENCE",
+            Screen::Update => "UPDATE CREDENTIAL",
+            Screen::UpdateDetails => "UPDATE CREDENTIAL · METADATA",
+            Screen::UpdateSecret => "UPDATE CREDENTIAL · SECRET",
             Screen::Register => "REGISTER CREDENTIAL",
             Screen::Rotate => "ROTATE CREDENTIAL",
             Screen::SetNotionApiKey => "STORE NOTION API KEY",
@@ -119,29 +144,34 @@ impl Screen {
             Screen::Search => "Type to filter · ↑ / ↓ select · Enter view details · Esc to go back",
             Screen::List => "↑ / ↓ Navigate · Enter View details · r Refresh · Esc Back",
             Screen::Details => "↑ / ↓ Scroll · c Copy secret · Esc Back · q Menu",
-            Screen::Update => {
-                "Type to edit · Tab / ↑ / ↓ switches fields · Enter to save · Esc to go back"
+            Screen::Update => "↑ / ↓ Navigate · Enter edit · Esc Back",
+            Screen::UpdateDetails => {
+                "Type to edit · Tab / ↑ / ↓ switches fields · Enter to continue · Esc to go back"
+            }
+            Screen::UpdateSecret => {
+                "Type a new secret (hidden) · Enter saves · leave empty to keep the current secret · Esc back"
             }
             Screen::Register => {
                 "Type to edit · Tab / ↑ / ↓ switches fields · Enter to save · Esc to go back"
             }
             Screen::Rotate => "↑ / ↓ to choose · Enter to rotate · Esc to go back",
-            Screen::SetNotionApiKey => {
-                "Type to edit · Enter to save · Esc to go back"
-            }
+            Screen::SetNotionApiKey => "Type to edit · Enter to save · Esc to go back",
             Screen::DeleteNotionApiKey => {
                 "Type DELETE to confirm · Enter to delete · Esc to go back"
             }
-            Screen::DeleteCredential => {
-                "↑ / ↓ Navigate · Enter delete · Esc to go back"
-            }
+            Screen::DeleteCredential => "↑ / ↓ Navigate · Enter delete · Esc to go back",
         }
     }
 
     fn is_form(self) -> bool {
         matches!(
             self,
-            Screen::AddDetails | Screen::Search | Screen::Update | Screen::Register | Screen::SetNotionApiKey | Screen::DeleteNotionApiKey
+            Screen::AddDetails
+                | Screen::Search
+                | Screen::UpdateDetails
+                | Screen::Register
+                | Screen::SetNotionApiKey
+                | Screen::DeleteNotionApiKey
         )
     }
 }
@@ -151,7 +181,17 @@ enum PendingAction {
     CopySecret,
     LoadItems,
     CreateItem,
-    RegisterExisting { item_id: String, item_title: String },
+    RegisterExisting {
+        item_id: String,
+        item_title: String,
+    },
+    UpdateCredential {
+        page_id: String,
+        metadata: NewCredential,
+        original_name: String,
+        original_reference: Option<String>,
+        new_secret: Option<String>,
+    },
 }
 
 struct Form {
@@ -268,7 +308,12 @@ impl Dashboard {
             }
             Screen::AddDetails => Form::new(&ADD_FIELDS),
             Screen::Search => Form::new(&["Query"]),
-            Screen::Update => Form::new(&["Credential name", "New credential reference"]),
+            Screen::Update => {
+                self.secret_input.clear();
+                Form::new(&[])
+            }
+            Screen::UpdateDetails => Form::new(&UPDATE_FIELDS),
+            Screen::UpdateSecret => Form::new(&[]),
             Screen::Register => Form::new(&["Existing credential", "Notion name"]),
             Screen::SetNotionApiKey => Form::new(&["Notion API Key"]),
             Screen::DeleteNotionApiKey => Form::new(&["Type DELETE to confirm"]),
@@ -277,9 +322,12 @@ impl Dashboard {
 
         let loaded = matches!(
             screen,
-            Screen::List | Screen::Search | Screen::Rotate | Screen::DeleteCredential
-        )
-        && self.load_credentials();
+            Screen::List
+                | Screen::Search
+                | Screen::Update
+                | Screen::Rotate
+                | Screen::DeleteCredential
+        ) && self.load_credentials();
 
         if screen == Screen::Search {
             self.search_selected = 0;
@@ -292,6 +340,8 @@ impl Dashboard {
             );
         } else if screen == Screen::Rotate && loaded && self.credentials.is_empty() {
             self.status = "No credentials available to rotate.".to_string();
+        } else if screen == Screen::Update && loaded && self.credentials.is_empty() {
+            self.status = "No credentials available to update.".to_string();
         } else if screen == Screen::DeleteCredential && loaded && self.credentials.is_empty() {
             self.status = "No credentials available to delete.".to_string();
         }
@@ -368,6 +418,19 @@ impl Dashboard {
                 item_id,
                 item_title,
             } => self.register_existing(&item_id, &item_title),
+            PendingAction::UpdateCredential {
+                page_id,
+                metadata,
+                original_name,
+                original_reference,
+                new_secret,
+            } => self.apply_update(
+                page_id,
+                metadata,
+                original_name,
+                original_reference,
+                new_secret,
+            ),
         }
     }
 
@@ -417,9 +480,8 @@ impl Dashboard {
                 self.screen = Screen::AddSecret;
                 secret.clear();
                 drop(secret);
-                self.status = format!(
-                    "Credential creation failed. No Notion entry was created. ({error:#})"
-                );
+                self.status =
+                    format!("Credential creation failed. No Notion entry was created. ({error:#})");
                 return;
             }
         };
@@ -508,6 +570,73 @@ impl Dashboard {
         }
     }
 
+    fn credential_from_update_form(&self) -> NewCredential {
+        NewCredential {
+            name: self.form.value(0).trim().to_string(),
+            purpose: self.form.value(1).trim().to_string(),
+            credential_reference: self.form.value(2).trim().to_string(),
+            environment_variable: self.form.value(3).trim().to_string(),
+            environment: self.form.value(4).trim().to_string(),
+            repository: self.form.value(5).trim().to_string(),
+            owner: self.form.value(6).trim().to_string(),
+            rotation_frequency: self.form.value(7).trim().to_string(),
+            last_rotated: optional_value(self.form.value(8)),
+            next_rotation_due: optional_value(self.form.value(9)),
+        }
+    }
+
+    fn apply_update(
+        &mut self,
+        page_id: String,
+        metadata: NewCredential,
+        original_name: String,
+        original_reference: Option<String>,
+        new_secret: Option<String>,
+    ) {
+        let name = metadata.name.clone();
+
+        if let Err(error) = update_credential(&page_id, &metadata, &self.database) {
+            self.status = format!("Failed to update '{original_name}' in Notion: {error:#}");
+            return;
+        }
+
+        let local = self.database.update_credential(
+            original_reference.as_deref(),
+            &original_name,
+            &name,
+            new_secret.as_deref(),
+        );
+
+        let status = match (local, new_secret.is_some()) {
+            (Ok(true), true) => {
+                format!("Updated '{name}' in Notion and replaced the local secret.")
+            }
+            (Ok(true), false) => format!("Updated '{name}' in Notion and the local database."),
+            (Ok(false), _) => {
+                format!("Updated '{name}' in Notion. No local secret was found to update.")
+            }
+            (Err(error), _) => format!(
+                "Updated '{name}' in Notion, but the local database update failed: {error:#}"
+            ),
+        };
+
+        self.refresh_update_screen(&name, status);
+    }
+
+    fn refresh_update_screen(&mut self, name: &str, status: String) {
+        self.screen = Screen::Update;
+        self.form = Form::new(&[]);
+        self.secret_input.clear();
+
+        // load_credentials resets the selection, so restore it by name.
+        if self.load_credentials() {
+            if let Some(index) = self.credentials.iter().position(|item| item.name == name) {
+                self.selected_credential = index;
+            }
+            self.status = status;
+        }
+    }
+
     fn copy_selected_secret(&mut self) {
         let Some(credential) = self.credentials.get(self.selected_credential) else {
             self.status = "No credential selected.".to_string();
@@ -526,7 +655,10 @@ impl Dashboard {
         };
 
         match self.database.copy_secret_to_clipboard(reference) {
-            Ok(()) => self.status = "Secret output to terminal.".to_string(),
+            Ok(true) => self.status = "Secret copied to clipboard.".to_string(),
+            Ok(false) => {
+                self.status = "Clipboard unavailable. Secret printed to the terminal.".to_string()
+            }
             Err(error) => {
                 self.status = format!("Could not copy credential: {error:#}");
             }
@@ -616,14 +748,64 @@ impl Dashboard {
                 self.status = "Registering the selected credential in Notion…".to_string();
             }
             Screen::Update => {
-                let name = self.form.value(0).trim().to_string();
-                let reference = self.form.value(1).trim().to_string();
-                if name.is_empty() || reference.is_empty() {
-                    self.status = "Credential name and reference are required.".to_string();
+                if self.credentials.is_empty() {
+                    self.status = "No credentials available to update.".to_string();
                     return;
                 }
-                self.status = format!("Update '{name}': Notion/database are not connected yet.");
-                self.back_to_menu();
+                let index = self.selected_credential.min(self.credentials.len() - 1);
+                self.selected_credential = index;
+                self.form = update_form(&self.credentials[index]);
+                self.secret_input.clear();
+                self.screen = Screen::UpdateDetails;
+                self.status = Screen::UpdateDetails.hint().to_string();
+            }
+            Screen::UpdateDetails => {
+                for index in REQUIRED_UPDATE_FIELDS {
+                    if self.form.value(index).trim().is_empty() {
+                        self.status = format!("{} is required.", UPDATE_FIELDS[index]);
+                        return;
+                    }
+                }
+
+                for index in [8, 9] {
+                    let value = self.form.value(index).trim();
+                    if !value.is_empty() && !is_date_like(value) {
+                        self.status =
+                            format!("{} must use YYYY-MM-DD format.", UPDATE_FIELDS[index]);
+                        return;
+                    }
+                }
+
+                self.secret_input.clear();
+                self.screen = Screen::UpdateSecret;
+                self.status = Screen::UpdateSecret.hint().to_string();
+            }
+            Screen::UpdateSecret => {
+                let Some(credential) = self.credentials.get(self.selected_credential) else {
+                    self.status = "No credential selected.".to_string();
+                    return;
+                };
+                let page_id = credential.id.clone().filter(|id| !id.trim().is_empty());
+                let original_name = credential.name.clone();
+                let original_reference = credential.credential_reference.clone();
+
+                let Some(page_id) = page_id else {
+                    self.status = format!("'{original_name}' has no Notion page ID.");
+                    return;
+                };
+
+                let metadata = self.credential_from_update_form();
+                let new_secret = optional_value(&self.secret_input);
+                self.secret_input.clear();
+                self.pending_action = Some(PendingAction::UpdateCredential {
+                    page_id,
+                    metadata,
+                    original_name,
+                    original_reference,
+                    new_secret,
+                });
+                self.status =
+                    "Updating the credential in Notion and the local database…".to_string();
             }
             Screen::Register => {
                 let item = self.form.value(0).trim().to_string();
@@ -662,7 +844,7 @@ impl Dashboard {
             }
             Screen::DeleteNotionApiKey => {
                 let confirmation = self.form.value(0).trim();
-                if confirmation != "DELETE" {
+                if confirmation.to_uppercase() != "DELETE" {
                     self.status = "Type DELETE to confirm removal.".to_string();
                     return;
                 }
@@ -676,36 +858,59 @@ impl Dashboard {
                     }
                 }
             }
-    Screen::DeleteCredential => {
-        if self.credentials.is_empty() {
-            self.status = "No credentials available to delete.".to_string();
-            return;
-        }
-        let index = self.selected_credential.min(self.credentials.len() - 1);
-        let reference = match &self.credentials[index].credential_reference {
-            Some(ref_) => ref_.clone(),
-            None => {
-                self.status = "Credential has no reference to delete.".to_string();
-                return;
-            }
-        };
-        let name = self.credentials[index].name.clone();
-        match self.database.delete_item_by_reference(&reference) {
-            Ok(()) => {
-                self.status = format!("Deleted '{name}' from database.");
-                self.load_credentials();
+            Screen::DeleteCredential => {
                 if self.credentials.is_empty() {
-                    self.selected_credential = 0;
-                } else if index >= self.credentials.len() {
-                    self.selected_credential = self.credentials.len() - 1;
+                    self.status = "No credentials available to delete.".to_string();
+                    return;
+                }
+                let index = self.selected_credential.min(self.credentials.len() - 1);
+                let page_id = self.credentials[index].id.clone();
+                let reference = self.credentials[index].credential_reference.clone();
+                let name = self.credentials[index].name.clone();
+                let archived = page_id.is_some();
+
+                if let Some(page_id) = page_id.as_deref() {
+                    if let Err(error) = archive_credential(page_id, &self.database) {
+                        self.status = format!("Failed to delete '{name}' from Notion: {error:#}");
+                        return;
+                    }
+                }
+
+                let (status, refresh) = match self
+                    .database
+                    .delete_credential(reference.as_deref(), &name)
+                {
+                    Ok(true) if archived => (
+                        format!("Deleted '{name}' from Notion and the local database."),
+                        true,
+                    ),
+                    Ok(true) => (format!("Deleted '{name}' from the local database."), true),
+                    Ok(false) if archived => (
+                        format!("Deleted '{name}' from Notion. No local secret was stored."),
+                        true,
+                    ),
+                    Ok(false) => (format!("No local secret found for '{name}'."), false),
+                    Err(error) if archived => (
+                        format!(
+                            "Removed '{name}' from Notion, but failed to delete the local secret: {error:#}"
+                        ),
+                        true,
+                    ),
+                    Err(error) => (format!("Failed to delete '{name}': {error:#}"), false),
+                };
+
+                self.status = status;
+
+                if refresh {
+                    self.load_credentials();
+                    if self.credentials.is_empty() {
+                        self.selected_credential = 0;
+                    } else if index >= self.credentials.len() {
+                        self.selected_credential = self.credentials.len() - 1;
+                    }
                 }
             }
-            Err(error) => {
-                self.status = format!("Failed to delete '{name}': {error:#}");
-            }
-        }
-    }
-    Screen::Details => {}
+            Screen::Details => {}
             Screen::AddResult => {}
         }
     }
@@ -734,6 +939,17 @@ impl Dashboard {
                     self.screen = Screen::AddDetails;
                     self.status = Screen::AddDetails.hint().to_string();
                 }
+                Screen::UpdateSecret => {
+                    self.secret_input.clear();
+                    self.screen = Screen::UpdateDetails;
+                    self.status =
+                        "Secret entry cancelled. The current secret was kept.".to_string();
+                }
+                Screen::UpdateDetails => {
+                    self.secret_input.clear();
+                    self.screen = Screen::Update;
+                    self.status = Screen::Update.hint().to_string();
+                }
                 Screen::AddDetails => {
                     self.secret_input.clear();
                     self.screen = Screen::Add;
@@ -760,6 +976,7 @@ impl Dashboard {
                 Screen::AddExisting => self.select_item(-1),
                 Screen::Details => self.details_offset = self.details_offset.saturating_sub(1),
                 Screen::AddSecret => {}
+                Screen::UpdateSecret => {}
                 Screen::AddResult => {}
                 _ if self.screen.is_form() => self.form.previous(),
                 _ => self.select_credential(-1),
@@ -770,12 +987,13 @@ impl Dashboard {
                 Screen::AddExisting => self.select_item(1),
                 Screen::Details => self.details_offset += 1,
                 Screen::AddSecret => {}
+                Screen::UpdateSecret => {}
                 Screen::AddResult => {}
                 _ if self.screen.is_form() => self.form.next(),
                 _ => self.select_credential(1),
             },
             KeyCode::Backspace => {
-                if self.screen == Screen::AddSecret {
+                if matches!(self.screen, Screen::AddSecret | Screen::UpdateSecret) {
                     self.secret_input.pop();
                 } else if self.screen.is_form() {
                     self.form.backspace();
@@ -785,7 +1003,7 @@ impl Dashboard {
                 }
             }
             KeyCode::Char(character) => {
-                if self.screen == Screen::AddSecret {
+                if matches!(self.screen, Screen::AddSecret | Screen::UpdateSecret) {
                     self.secret_input.push(character);
                 } else if self.screen.is_form() {
                     self.form.push(character);
@@ -909,11 +1127,23 @@ impl Dashboard {
             Screen::Details => {
                 self.render_details(frame, layout[1]);
             }
-            Screen::Update => self.render_form(
+            Screen::Update => {
+                let items = credential_items(&self.credentials);
+                render_selectable_list(
+                    frame,
+                    layout[1],
+                    self.screen.title(),
+                    items,
+                    self.selected_credential,
+                    Some("No credentials available to update."),
+                );
+            }
+            Screen::UpdateDetails => self.render_form(
                 frame,
                 layout[1],
-                "Enter the credential name and the new credential reference.",
+                "Changes are written to Notion; the secret stays in the local SQLite database.",
             ),
+            Screen::UpdateSecret => self.render_update_secret(frame, layout[1]),
             Screen::Register => self.render_form(
                 frame,
                 layout[1],
@@ -1038,6 +1268,66 @@ impl Dashboard {
                 Style::default().fg(ACCENT),
             )),
         ];
+
+        frame.render_widget(
+            Paragraph::new(lines)
+                .style(Style::default().bg(PANEL_BG))
+                .block(accent_panel(self.screen.title())),
+            area,
+        );
+    }
+
+    fn render_update_secret(&self, frame: &mut Frame, area: Rect) {
+        let name = self.form.value(0).trim();
+
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled("  Credential  ", Style::default().fg(MUTED)),
+                Span::styled(
+                    name.to_string(),
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(""),
+        ];
+
+        if self.secret_input.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("  New secret  ", Style::default().fg(MUTED)),
+                Span::styled(
+                    "unchanged",
+                    Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("▌", Style::default().fg(ACCENT)),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("  New secret  ", Style::default().fg(MUTED)),
+                Span::styled(
+                    "••••••••",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("▌", Style::default().fg(ACCENT)),
+                Span::styled("  (hidden)", Style::default().fg(MUTED)),
+            ]));
+        }
+
+        lines.extend([
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Leave the field empty and press Enter to keep the current secret.",
+                Style::default().fg(MUTED),
+            )),
+            Line::from(Span::styled(
+                "  Secrets are never rendered, logged, or sent to Notion.",
+                Style::default().fg(MUTED),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Enter to save · Esc to cancel",
+                Style::default().fg(ACCENT),
+            )),
+        ]);
 
         frame.render_widget(
             Paragraph::new(lines)
@@ -1264,6 +1554,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    terminal.hide_cursor()?;
+    show_splash(&mut terminal)?;
+
     let result = show_dashboard(&mut terminal, database);
 
     disable_raw_mode()?;
@@ -1271,6 +1564,115 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     terminal.show_cursor()?;
 
     result
+}
+
+fn show_splash(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+    let start = Instant::now();
+
+    loop {
+        let elapsed = start.elapsed();
+        terminal.draw(|frame| render_splash(frame, elapsed))?;
+
+        if elapsed >= SPLASH_DURATION {
+            break;
+        }
+
+        let wait = SPLASH_DURATION.saturating_sub(elapsed).min(SPLASH_FRAME);
+
+        if event::poll(wait)? {
+            match event::read()? {
+                Event::Key(key) if key.kind != KeyEventKind::Release => break,
+                _ => {}
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn render_splash(frame: &mut Frame, elapsed: Duration) {
+    let area = frame.area();
+    frame.render_widget(Block::default().style(Style::default().bg(BG)), area);
+
+    let millis = elapsed.as_millis() as usize;
+
+    let wordmark: Vec<Span<'static>> = "QuantumData"
+        .chars()
+        .enumerate()
+        .map(|(index, character)| {
+            let color = SPLASH_COLORS[(millis / 90 + index) % SPLASH_COLORS.len()];
+            Span::styled(
+                character.to_string(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )
+        })
+        .collect();
+
+    let subtitle = "API CREDENTIAL MANAGER";
+    let revealed = ((millis.saturating_sub(250)) / 18).min(subtitle.len());
+    let subtitle = &subtitle[..revealed];
+
+    let scan_width = (area.width.saturating_sub(12) as usize).min(46);
+    let scan_line = if scan_width >= 8 {
+        let head = (millis / 35) % scan_width;
+        let spans = (0..scan_width)
+            .map(|index| {
+                let distance = index.abs_diff(head);
+                let style = if distance == 0 {
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
+                } else if distance <= 3 {
+                    Style::default().fg(ACCENT)
+                } else {
+                    Style::default().fg(BORDER)
+                };
+                Span::styled("━", style)
+            })
+            .collect::<Vec<_>>();
+
+        Line::from(spans)
+    } else {
+        Line::from("")
+    };
+
+    let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let dots = ".".repeat((millis / 250) % 4);
+    let status = format!(
+        "{}  Initializing secure vault{}",
+        spinner[(millis / 80) % spinner.len()],
+        dots
+    );
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(wordmark),
+        Line::from(Span::styled(
+            subtitle.to_string(),
+            Style::default().fg(MUTED),
+        )),
+        Line::from(""),
+        scan_line,
+        Line::from(""),
+        Line::from(Span::styled(status, Style::default().fg(AMBER))),
+    ];
+
+    if millis > 700 {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "press any key to continue",
+            Style::default().fg(MUTED),
+        )));
+    }
+
+    let top_padding = area.height.saturating_sub(lines.len() as u16) / 2;
+    let mut content = vec![Line::from(""); top_padding as usize];
+    content.append(&mut lines);
+
+    frame.render_widget(
+        Paragraph::new(content)
+            .alignment(Alignment::Center)
+            .style(Style::default().bg(BG)),
+        area,
+    );
 }
 
 fn suspend_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
@@ -1496,6 +1898,31 @@ fn credential_items(credentials: &[Credential]) -> Vec<ListItem<'static>> {
     credentials.iter().map(credential_item).collect()
 }
 
+fn update_form(credential: &Credential) -> Form {
+    let mut form = Form::new(&UPDATE_FIELDS);
+
+    let values = [
+        Some(credential.name.as_str()),
+        credential.purpose.as_deref(),
+        credential.credential_reference.as_deref(),
+        credential.environment_variable.as_deref(),
+        credential.environment.as_deref(),
+        credential.repository.as_deref(),
+        credential.owner.as_deref(),
+        credential.rotation_frequency.as_deref(),
+        credential.last_rotated.as_deref(),
+        credential.next_rotation_due.as_deref(),
+    ];
+
+    for ((_, field), value) in form.fields.iter_mut().zip(values) {
+        if let Some(value) = value {
+            field.push_str(value);
+        }
+    }
+
+    form
+}
+
 fn credential_item(credential: &Credential) -> ListItem<'static> {
     let status = credential.status.as_deref().unwrap_or("Unknown");
     let environment = credential.environment.as_deref().unwrap_or("—");
@@ -1553,13 +1980,44 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
-    fn test_database() -> Database {
+    fn test_database() -> (Database, NamedTempFile) {
         let file = NamedTempFile::new().expect("failed to create temp file");
-        Database::open(file.path()).expect("failed to open test database")
+        let database = Database::open(file.path()).expect("failed to open test database");
+        (database, file)
+    }
+
+    fn sample_credential() -> Credential {
+        Credential {
+            id: Some("page-1".into()),
+            name: "OpenAI".into(),
+            description: None,
+            service: None,
+            username: None,
+            status: Some("Active".into()),
+            purpose: Some("Model access".into()),
+            credential_reference: Some("sqlite://row-1".into()),
+            environment_variable: Some("OPENAI_API_KEY".into()),
+            environment: Some("Local".into()),
+            repository: Some("example/repo".into()),
+            owner: Some("Owner".into()),
+            rotation_frequency: Some("Every 90 days".into()),
+            last_rotated: Some("2026-01-01".into()),
+            next_rotation_due: None,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    fn updatable_dashboard() -> Dashboard {
+        let (database, _file) = test_database();
+        let mut dashboard = Dashboard::new(database);
+        dashboard.credentials = vec![sample_credential()];
+        dashboard.screen = Screen::Update;
+        dashboard
     }
 
     fn filled_dashboard() -> Dashboard {
-        let database = test_database();
+        let (database, _file) = test_database();
         let mut dashboard = Dashboard::new(database);
         dashboard.open(Screen::Add);
         dashboard.submit();
@@ -1583,7 +2041,8 @@ mod tests {
 
     #[test]
     fn add_defaults_to_create_new() {
-        let mut dashboard = Dashboard::new(test_database());
+        let (database, _file) = test_database();
+        let mut dashboard = Dashboard::new(database);
         dashboard.open(Screen::Add);
 
         assert_eq!(dashboard.add_choice, 0);
@@ -1693,7 +2152,8 @@ mod tests {
 
     #[test]
     fn escaping_the_choice_screen_returns_to_the_menu() {
-        let mut dashboard = Dashboard::new(test_database());
+        let (database, _file) = test_database();
+        let mut dashboard = Dashboard::new(database);
         dashboard.open(Screen::Add);
 
         dashboard.handle_key(KeyCode::Esc);
@@ -1757,5 +2217,149 @@ mod tests {
         let credential = dashboard.credential_from_form("sqlite://vault/item/credential".into());
 
         assert_eq!(credential.last_rotated.as_deref(), Some("2026-01-01"));
+    }
+
+    #[test]
+    fn update_opens_a_prefilled_metadata_form() {
+        let mut dashboard = updatable_dashboard();
+
+        dashboard.submit();
+
+        assert_eq!(dashboard.screen, Screen::UpdateDetails);
+        assert_eq!(dashboard.form.value(0), "OpenAI");
+        assert_eq!(dashboard.form.value(1), "Model access");
+        assert_eq!(dashboard.form.value(2), "sqlite://row-1");
+        assert_eq!(dashboard.form.value(3), "OPENAI_API_KEY");
+        assert_eq!(dashboard.form.value(4), "Local");
+        assert_eq!(dashboard.form.value(7), "Every 90 days");
+        assert_eq!(dashboard.form.value(8), "2026-01-01");
+        assert_eq!(dashboard.form.value(9), "");
+    }
+
+    #[test]
+    fn update_requires_name_and_reference() {
+        let mut dashboard = updatable_dashboard();
+        dashboard.submit();
+        dashboard.form.fields[2].1.clear();
+
+        dashboard.submit();
+
+        assert_eq!(dashboard.screen, Screen::UpdateDetails);
+        assert_eq!(dashboard.status, "Credential Reference is required.");
+    }
+
+    #[test]
+    fn update_rejects_invalid_dates() {
+        let mut dashboard = updatable_dashboard();
+        dashboard.submit();
+        dashboard.form.fields[9].1 = "next tuesday".into();
+
+        dashboard.submit();
+
+        assert_eq!(dashboard.screen, Screen::UpdateDetails);
+        assert_eq!(
+            dashboard.status,
+            "Next Rotation Due must use YYYY-MM-DD format."
+        );
+    }
+
+    #[test]
+    fn update_advances_to_secret_entry_without_requiring_a_secret() {
+        let mut dashboard = updatable_dashboard();
+        dashboard.submit();
+
+        dashboard.submit();
+
+        assert_eq!(dashboard.screen, Screen::UpdateSecret);
+        assert!(dashboard.secret_input.is_empty());
+        assert!(dashboard.pending_action.is_none());
+    }
+
+    #[test]
+    fn update_carries_metadata_and_keeps_the_secret_when_empty() {
+        let mut dashboard = updatable_dashboard();
+        dashboard.submit();
+        dashboard.form.fields[7].1 = "Every 30 days".into();
+        dashboard.submit();
+
+        dashboard.handle_key(KeyCode::Enter);
+
+        match dashboard.pending_action {
+            Some(PendingAction::UpdateCredential {
+                ref page_id,
+                ref metadata,
+                ref original_name,
+                ref original_reference,
+                ref new_secret,
+            }) => {
+                assert_eq!(page_id, "page-1");
+                assert_eq!(metadata.rotation_frequency, "Every 30 days");
+                assert_eq!(metadata.credential_reference, "sqlite://row-1");
+                assert_eq!(original_name, "OpenAI");
+                assert_eq!(original_reference.as_deref(), Some("sqlite://row-1"));
+                assert!(new_secret.is_none());
+            }
+            ref other => panic!("unexpected action: {other:?}"),
+        }
+        assert!(dashboard.secret_input.is_empty());
+    }
+
+    #[test]
+    fn update_secret_is_hidden_and_discarded_on_cancel() {
+        let mut dashboard = updatable_dashboard();
+        dashboard.submit();
+        dashboard.submit();
+
+        for character in "new-secret".chars() {
+            dashboard.handle_key(KeyCode::Char(character));
+        }
+
+        assert_eq!(dashboard.secret_input, "new-secret");
+        assert!(!dashboard.status.contains("new-secret"));
+
+        dashboard.handle_key(KeyCode::Esc);
+
+        assert_eq!(dashboard.screen, Screen::UpdateDetails);
+        assert!(dashboard.secret_input.is_empty());
+    }
+
+    #[test]
+    fn update_carries_a_replacement_secret_separately() {
+        let mut dashboard = updatable_dashboard();
+        dashboard.submit();
+        dashboard.submit();
+
+        for character in "rotated".chars() {
+            dashboard.handle_key(KeyCode::Char(character));
+        }
+        dashboard.handle_key(KeyCode::Enter);
+
+        match dashboard.pending_action {
+            Some(PendingAction::UpdateCredential {
+                ref metadata,
+                ref new_secret,
+                ..
+            }) => {
+                assert_eq!(new_secret.as_deref(), Some("rotated"));
+                assert_eq!(metadata.owner, "Owner");
+                assert!(!metadata.purpose.contains("rotated"));
+            }
+            ref other => panic!("unexpected action: {other:?}"),
+        }
+        assert!(dashboard.secret_input.is_empty());
+    }
+
+    #[test]
+    fn update_without_a_page_id_is_refused() {
+        let mut dashboard = updatable_dashboard();
+        dashboard.credentials[0].id = None;
+        dashboard.submit();
+        dashboard.submit();
+
+        dashboard.submit();
+
+        assert_eq!(dashboard.screen, Screen::UpdateSecret);
+        assert_eq!(dashboard.status, "'OpenAI' has no Notion page ID.");
+        assert!(dashboard.pending_action.is_none());
     }
 }

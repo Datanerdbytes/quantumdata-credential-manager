@@ -5,6 +5,7 @@ use crate::models::Credential;
 use crate::notion::client::NotionClient;
 use crate::secrets::Database;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewCredential {
     pub name: String,
     pub purpose: String,
@@ -194,7 +195,10 @@ fn credential_properties(credential: &NewCredential) -> Value {
     );
 
     if !credential.environment.trim().is_empty() {
-        properties.insert("Environment".into(), select_property(&credential.environment));
+        properties.insert(
+            "Environment".into(),
+            select_property(&credential.environment),
+        );
     }
 
     properties.insert("Repository".into(), text_property(&credential.repository));
@@ -218,9 +222,91 @@ fn credential_properties(credential: &NewCredential) -> Value {
     Value::Object(properties)
 }
 
+fn text_property_or_clear(content: &str) -> Value {
+    if content.trim().is_empty() {
+        json!({ "rich_text": [] })
+    } else {
+        text_property(content)
+    }
+}
+
+fn select_property_or_clear(name: &str) -> Value {
+    if name.trim().is_empty() {
+        json!({ "select": null })
+    } else {
+        select_property(name)
+    }
+}
+
+fn date_property_or_clear(value: Option<&str>) -> Value {
+    match value {
+        Some(value) if !value.trim().is_empty() => date_property(value),
+        _ => json!({ "date": null }),
+    }
+}
+
+// Updates leave Status alone and explicitly clear emptied fields, because
+// Notion keeps the previous value when a property is omitted from a PATCH.
+fn update_properties(credential: &NewCredential) -> Value {
+    let mut properties = serde_json::Map::new();
+
+    properties.insert("Name".into(), title_property(&credential.name));
+    properties.insert(
+        "Purpose".into(),
+        text_property_or_clear(&credential.purpose),
+    );
+    properties.insert(
+        "Credential Reference".into(),
+        text_property_or_clear(&credential.credential_reference),
+    );
+    properties.insert(
+        "Environment Variable".into(),
+        text_property_or_clear(&credential.environment_variable),
+    );
+    properties.insert(
+        "Environment".into(),
+        select_property_or_clear(&credential.environment),
+    );
+    properties.insert(
+        "Repository".into(),
+        text_property_or_clear(&credential.repository),
+    );
+    properties.insert("Owner".into(), text_property_or_clear(&credential.owner));
+    properties.insert(
+        "Rotation Frequency".into(),
+        select_property_or_clear(&credential.rotation_frequency),
+    );
+    properties.insert(
+        "Last Rotated".into(),
+        date_property_or_clear(credential.last_rotated.as_deref()),
+    );
+    properties.insert(
+        "Next Rotation Due".into(),
+        date_property_or_clear(credential.next_rotation_due.as_deref()),
+    );
+
+    Value::Object(properties)
+}
+
 pub fn create_credential(credential: &NewCredential, database: &Database) -> Result<()> {
     let client = NotionClient::new(database)?;
     client.create_page(&credential_properties(credential))?;
+    Ok(())
+}
+
+pub fn update_credential(
+    page_id: &str,
+    credential: &NewCredential,
+    database: &Database,
+) -> Result<()> {
+    let client = NotionClient::new(database)?;
+    client.update_page(page_id, &update_properties(credential))?;
+    Ok(())
+}
+
+pub fn archive_credential(page_id: &str, database: &Database) -> Result<()> {
+    let client = NotionClient::new(database)?;
+    client.archive_page(page_id)?;
     Ok(())
 }
 
@@ -293,6 +379,43 @@ mod tests {
     #[test]
     fn properties_never_contain_secret_values() {
         let properties = credential_properties(&credential());
+
+        assert!(properties.get("Secret").is_none());
+        assert!(properties.get("credential").is_none());
+    }
+
+    #[test]
+    fn update_properties_do_not_touch_status() {
+        let properties = update_properties(&credential());
+
+        assert!(properties.get("Status").is_none());
+        assert_eq!(
+            properties["Name"]["title"][0]["text"]["content"],
+            "Test Credential"
+        );
+    }
+
+    #[test]
+    fn update_properties_clear_emptied_fields() {
+        let mut credential = credential();
+        credential.purpose.clear();
+        credential.environment.clear();
+        credential.rotation_frequency.clear();
+        credential.last_rotated = None;
+        credential.next_rotation_due = None;
+
+        let properties = update_properties(&credential);
+
+        assert_eq!(properties["Purpose"]["rich_text"], json!([]));
+        assert_eq!(properties["Environment"]["select"], Value::Null);
+        assert_eq!(properties["Rotation Frequency"]["select"], Value::Null);
+        assert_eq!(properties["Last Rotated"]["date"], Value::Null);
+        assert_eq!(properties["Next Rotation Due"]["date"], Value::Null);
+    }
+
+    #[test]
+    fn update_properties_never_contain_secret_values() {
+        let properties = update_properties(&credential());
 
         assert!(properties.get("Secret").is_none());
         assert!(properties.get("credential").is_none());
