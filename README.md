@@ -2,7 +2,7 @@
 
 A terminal UI for managing API credentials as Notion metadata while keeping the actual secrets in a local SQLite database.
 
-Notion stores the inventory — name, purpose, owner, environment, rotation dates, and a local database reference. The secret value never leaves your machine. The app runs directly on your host, so copying a secret to the clipboard works through `pbcopy` on macOS.
+Notion stores the inventory — name, purpose, owner, environment, rotation dates, and a local database reference. The secret value never leaves your machine. When you need a key, open it in the app and press `c`: the value goes straight to your clipboard, ready to paste into `.env`, a terminal, or a CI secret field. No vault, no Notion page, no scrolling through old notes.
 
 > **Security note:** secrets and the Notion API key are stored unencrypted in a local SQLite file. See [Data and security](#data-and-security).
 
@@ -14,13 +14,47 @@ Notion stores the inventory — name, purpose, owner, environment, rotation date
 
 ## Features
 
+- **One-key copy** — open any credential and press `c`. The secret is read from SQLite and piped to the clipboard, ready to paste into `.env`, a terminal, or an AI provider's API key field.
 - **Add credentials** — create a secret in SQLite and register the metadata in Notion, or link an existing local secret to a new Notion entry.
-- **Search and inspect** — filter credentials by name, open a detail view, and copy the secret to the clipboard with `c`.
+- **Search and inspect** — filter credentials by name and open a detail view that shows metadata only, never the secret.
 - **Update credentials** — edit every Notion metadata field from a prefilled form and optionally replace the secret stored in SQLite.
 - **Delete credentials** — archives the Notion page and removes the matching local secret. Falls back to a unique title match when the stored reference is stale.
 - **Notion API key management** — store or delete the Notion integration token from inside the app.
 - **Startup splash** — an animated QuantumData splash; press any key to skip it.
 - **Safe tests** — the test suite uses temporary databases and never calls Notion.
+
+## Copy an API key in seconds
+
+This is the highlight of the app. Whether you are wiring an AI provider into a side project, filling a CI secret, or refreshing a `.env` before a demo, you usually do not need to edit the credential — you just need the value on your clipboard, right now.
+
+1. Launch `api-manager` and choose **Search / Retrieve Credential** (or **List Credentials** to browse).
+2. Type part of the name. Results filter as you type.
+3. Press `Enter` to open the credential.
+4. Press `c`.
+
+The status line confirms the copy:
+
+```text
+Secret copied to clipboard.
+```
+
+Paste it wherever it is needed:
+
+```bash
+# load it into the current shell
+export OPENAI_API_KEY="$(pbpaste)"
+
+# or append it to a project's env file
+echo "OPENAI_API_KEY=$(pbpaste)" >> .env
+```
+
+What makes the flow fast and safe:
+
+- **Local lookup** — Notion is the index; the value comes from the local SQLite row, so the copy itself happens instantly on your machine.
+- **Never rendered** — the details screen shows metadata only. The secret is fetched when you press `c` and written straight to the clipboard, so it does not appear in the terminal or its scrollback.
+- **Confirmed on screen** — the status line tells you whether the copy succeeded.
+
+If `pbcopy` is unavailable (for example on Linux without a clipboard helper, or inside a container), the app prints the secret to stdout and says so instead. See [Data and security](#data-and-security).
 
 ## How it works
 
@@ -232,7 +266,7 @@ Dates must use `YYYY-MM-DD` (an ISO timestamp such as `2026-01-01T10:00:00Z` is 
 | `Enter` | Open the selected item |
 | `Esc` | Go back |
 | `r` | Refresh the Notion list (List screen only) |
-| `c` | Copy the selected secret (Details screen) |
+| `c` | Copy the secret to the clipboard (Details screen only) |
 | `q` | Return to the main menu |
 
 ### Credential flows
