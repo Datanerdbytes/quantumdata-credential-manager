@@ -19,7 +19,7 @@ use crate::models::Credential;
 use crate::notion::{NewCredential, create_credential};
 use crate::secrets::{Database, SecretItem};
 
-const MENU_ITEMS: [&str; 8] = [
+const MENU_ITEMS: [&str; 9] = [
     "Add Credential",
     "Search / Retrieve Credential",
     "List Credentials",
@@ -27,6 +27,7 @@ const MENU_ITEMS: [&str; 8] = [
     "Register Existing Credential",
     "Rotate Credential",
     "Store Notion API Key",
+    "Delete Notion API Key",
     "Exit",
 ];
 
@@ -77,6 +78,7 @@ enum Screen {
     Register,
     Rotate,
     SetNotionApiKey,
+    DeleteNotionApiKey,
 }
 
 impl Screen {
@@ -95,6 +97,7 @@ impl Screen {
             Screen::Register => "REGISTER CREDENTIAL",
             Screen::Rotate => "ROTATE CREDENTIAL",
             Screen::SetNotionApiKey => "STORE NOTION API KEY",
+            Screen::DeleteNotionApiKey => "DELETE NOTION API KEY",
         }
     }
 
@@ -123,13 +126,16 @@ impl Screen {
             Screen::SetNotionApiKey => {
                 "Type to edit · Enter to save · Esc to go back"
             }
+            Screen::DeleteNotionApiKey => {
+                "Type DELETE to confirm · Enter to delete · Esc to go back"
+            }
         }
     }
 
     fn is_form(self) -> bool {
         matches!(
             self,
-            Screen::AddDetails | Screen::Search | Screen::Update | Screen::Register
+            Screen::AddDetails | Screen::Search | Screen::Update | Screen::Register | Screen::SetNotionApiKey | Screen::DeleteNotionApiKey
         )
     }
 }
@@ -259,6 +265,7 @@ impl Dashboard {
             Screen::Update => Form::new(&["Credential name", "New credential reference"]),
             Screen::Register => Form::new(&["Existing credential", "Notion name"]),
             Screen::SetNotionApiKey => Form::new(&["Notion API Key"]),
+            Screen::DeleteNotionApiKey => Form::new(&["Type DELETE to confirm"]),
             _ => Form::new(&[]),
         };
 
@@ -508,7 +515,7 @@ impl Dashboard {
         };
 
         match self.database.copy_secret_to_clipboard(reference) {
-            Ok(()) => self.status = "Secret copied to clipboard.".to_string(),
+            Ok(()) => self.status = "Secret output to terminal.".to_string(),
             Err(error) => {
                 self.status = format!("Could not copy credential: {error:#}");
             }
@@ -642,7 +649,23 @@ impl Dashboard {
                     }
                 }
             }
-            Screen::Details => {}
+            Screen::DeleteNotionApiKey => {
+        let confirmation = self.form.value(0).trim();
+        if confirmation != "DELETE" {
+            self.status = "Type DELETE to confirm removal.".to_string();
+            return;
+        }
+        match self.database.delete_notion_api_key() {
+            Ok(()) => {
+                self.back_to_menu();
+                self.status = "Notion API Key deleted from database.".to_string();
+            }
+            Err(error) => {
+                self.status = format!("Failed to delete Notion API Key: {error:#}");
+            }
+        }
+    }
+    Screen::Details => {}
             Screen::AddResult => {}
         }
     }
@@ -768,6 +791,7 @@ impl Dashboard {
                     4 => Screen::Register,
                     5 => Screen::Rotate,
                     6 => Screen::SetNotionApiKey,
+                    7 => Screen::DeleteNotionApiKey,
                     _ => return true,
                 };
                 self.open(screen);
@@ -869,6 +893,11 @@ impl Dashboard {
                 frame,
                 layout[1],
                 "Enter your Notion API key. It will be stored in the local SQLite database.",
+            ),
+            Screen::DeleteNotionApiKey => self.render_form(
+                frame,
+                layout[1],
+                "Type DELETE to confirm removal of the Notion API Key from the local database.",
             ),
         }
 

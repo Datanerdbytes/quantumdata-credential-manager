@@ -147,31 +147,54 @@ impl Database {
 
         Ok(None)
     }
+
+    pub fn delete_notion_api_key(&self) -> Result<()> {
+        let rows_affected = self
+            .connection
+            .execute(
+                "DELETE FROM meta WHERE key = ?",
+                params![NOTION_API_KEY_ID],
+            )
+            .context("Failed to delete Notion API key from database")?;
+
+        if rows_affected == 0 {
+            return Err(anyhow!("No Notion API key found in database."));
+        }
+
+        Ok(())
+    }
 }
 
 fn copy_to_clipboard(text: &str) -> Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    let mut clipboard = Command::new("pbcopy")
+    match Command::new("pbcopy")
         .stdin(Stdio::piped())
         .spawn()
-        .context("Failed to launch macOS clipboard utility")?;
+    {
+        Ok(mut clipboard) => {
+            clipboard
+                .stdin
+                .take()
+                .context("Could not access clipboard input")?
+                .write_all(text.as_bytes())
+                .context("Failed to copy credential to clipboard")?;
 
-    clipboard
-        .stdin
-        .take()
-        .context("Could not access clipboard input")?
-        .write_all(text.as_bytes())
-        .context("Failed to copy credential to clipboard")?;
+            let status = clipboard
+                .wait()
+                .context("Failed to complete clipboard operation")?;
 
-    let status = clipboard
-        .wait()
-        .context("Failed to complete clipboard operation")?;
-
-    if !status.success() {
-        return Err(anyhow!("Failed to copy credential to clipboard."));
+            if status.success() {
+                return Ok(());
+            }
+        }
+        Err(_) => {
+            // pbcopy not available (e.g., inside Docker/Linux container)
+        }
     }
 
+    // Fallback: print to stdout so user can copy from terminal output
+    println!("{}", text);
     Ok(())
 }
