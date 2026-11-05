@@ -1,8 +1,22 @@
 use anyhow::{Context, Result};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::models::Credential;
 use crate::notion::client::NotionClient;
+use crate::secrets::Database;
+
+pub struct NewCredential {
+    pub name: String,
+    pub purpose: String,
+    pub credential_reference: String,
+    pub environment_variable: String,
+    pub environment: String,
+    pub repository: String,
+    pub owner: String,
+    pub rotation_frequency: String,
+    pub last_rotated: Option<String>,
+    pub next_rotation_due: Option<String>,
+}
 
 fn rich_text_value(property: &Value) -> Option<String> {
     let items = property.get("rich_text")?.as_array()?;
@@ -90,8 +104,8 @@ fn map_page(page: &Value) -> Result<Credential> {
     })
 }
 
-pub fn list_credentials() -> Result<Vec<Credential>> {
-    let client = NotionClient::new()?;
+pub fn list_credentials(database: &Database) -> Result<Vec<Credential>> {
+    let client = NotionClient::new(database)?;
 
     let mut credentials = Vec::new();
     let mut cursor: Option<String> = None;
@@ -128,4 +142,159 @@ pub fn list_credentials() -> Result<Vec<Credential>> {
     }
 
     Ok(credentials)
+}
+
+fn title_property(content: &str) -> Value {
+    json!({
+        "title": [
+            {
+                "type": "text",
+                "text": { "content": content }
+            }
+        ]
+    })
+}
+
+fn text_property(content: &str) -> Value {
+    json!({
+        "rich_text": [
+            {
+                "type": "text",
+                "text": { "content": content }
+            }
+        ]
+    })
+}
+
+fn select_property(name: &str) -> Value {
+    json!({
+        "select": { "name": name }
+    })
+}
+
+fn date_property(value: &str) -> Value {
+    json!({
+        "date": { "start": value }
+    })
+}
+
+fn credential_properties(credential: &NewCredential) -> Value {
+    let mut properties = serde_json::Map::new();
+
+    properties.insert("Name".into(), title_property(&credential.name));
+    properties.insert("Status".into(), select_property("Active"));
+    properties.insert("Purpose".into(), text_property(&credential.purpose));
+    properties.insert(
+        "Credential Reference".into(),
+        text_property(&credential.credential_reference),
+    );
+    properties.insert(
+        "Environment Variable".into(),
+        text_property(&credential.environment_variable),
+    );
+
+    if !credential.environment.trim().is_empty() {
+        properties.insert("Environment".into(), select_property(&credential.environment));
+    }
+
+    properties.insert("Repository".into(), text_property(&credential.repository));
+    properties.insert("Owner".into(), text_property(&credential.owner));
+
+    if !credential.rotation_frequency.trim().is_empty() {
+        properties.insert(
+            "Rotation Frequency".into(),
+            select_property(&credential.rotation_frequency),
+        );
+    }
+
+    if let Some(value) = credential.last_rotated.as_deref() {
+        properties.insert("Last Rotated".into(), date_property(value));
+    }
+
+    if let Some(value) = credential.next_rotation_due.as_deref() {
+        properties.insert("Next Rotation Due".into(), date_property(value));
+    }
+
+    Value::Object(properties)
+}
+
+pub fn create_credential(credential: &NewCredential, database: &Database) -> Result<()> {
+    let client = NotionClient::new(database)?;
+    client.create_page(&credential_properties(credential))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn credential() -> NewCredential {
+        NewCredential {
+            name: "Test Credential".into(),
+            purpose: "Testing".into(),
+            credential_reference: "sqlite://Developer Credentials/item/credential".into(),
+            environment_variable: "TEST_API_KEY".into(),
+            environment: "Local".into(),
+            repository: "example/repo".into(),
+            owner: "Owner".into(),
+            rotation_frequency: "Every 90 days".into(),
+            last_rotated: None,
+            next_rotation_due: None,
+        }
+    }
+
+    #[test]
+    fn maps_required_properties() {
+        let properties = credential_properties(&credential());
+
+        assert_eq!(
+            properties["Name"]["title"][0]["text"]["content"],
+            "Test Credential"
+        );
+        assert_eq!(properties["Status"]["select"]["name"], "Active");
+        assert_eq!(
+            properties["Credential Reference"]["rich_text"][0]["text"]["content"],
+            "sqlite://Developer Credentials/item/credential"
+        );
+        assert_eq!(
+            properties["Environment Variable"]["rich_text"][0]["text"]["content"],
+            "TEST_API_KEY"
+        );
+        assert_eq!(properties["Environment"]["select"]["name"], "Local");
+        assert_eq!(
+            properties["Rotation Frequency"]["select"]["name"],
+            "Every 90 days"
+        );
+    }
+
+    #[test]
+    fn omits_optional_dates_when_absent() {
+        let properties = credential_properties(&credential());
+
+        assert!(properties.get("Last Rotated").is_none());
+        assert!(properties.get("Next Rotation Due").is_none());
+    }
+
+    #[test]
+    fn includes_optional_dates_when_present() {
+        let mut credential = credential();
+        credential.last_rotated = Some("2026-01-01".into());
+        credential.next_rotation_due = Some("2026-04-01".into());
+
+        let properties = credential_properties(&credential);
+
+        assert_eq!(properties["Last Rotated"]["date"]["start"], "2026-01-01");
+        assert_eq!(
+            properties["Next Rotation Due"]["date"]["start"],
+            "2026-04-01"
+        );
+    }
+
+    #[test]
+    fn properties_never_contain_secret_values() {
+        let properties = credential_properties(&credential());
+
+        assert!(properties.get("Secret").is_none());
+        assert!(properties.get("credential").is_none());
+    }
 }

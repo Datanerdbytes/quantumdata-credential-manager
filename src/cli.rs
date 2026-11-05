@@ -12,20 +12,42 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use crate::models::Credential;
+use crate::notion::{NewCredential, create_credential};
+use crate::secrets::{Database, SecretItem};
 
-const MENU_ITEMS: [&str; 7] = [
+const MENU_ITEMS: [&str; 8] = [
     "Add Credential",
     "Search / Retrieve Credential",
     "List Credentials",
     "Update Credential Reference",
-    "Register Existing 1Password Item",
+    "Register Existing Credential",
     "Rotate Credential",
+    "Store Notion API Key",
     "Exit",
 ];
+
+const ADD_CHOICES: [&str; 2] = [
+    "Create a new credential",
+    "Use an existing credential",
+];
+
+const ADD_FIELDS: [&str; 9] = [
+    "Name",
+    "Purpose",
+    "Environment Variable",
+    "Environment",
+    "Repository",
+    "Owner",
+    "Rotation Frequency",
+    "Last Rotated",
+    "Next Rotation Due",
+];
+
+const REQUIRED_ADD_FIELDS: usize = 1;
 
 const BG: Color = Color::Rgb(11, 18, 32);
 const PANEL_BG: Color = Color::Rgb(5, 8, 15);
@@ -40,16 +62,21 @@ const BADGE_INACTIVE_BG: Color = Color::Rgb(46, 36, 18);
 const BADGE_REVOKED_BG: Color = Color::Rgb(48, 20, 20);
 const SELECT_BG: Color = Color::Rgb(27, 42, 68);
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Menu,
     Add,
+    AddDetails,
+    AddSecret,
+    AddExisting,
+    AddResult,
     Search,
     List,
     Details,
     Update,
     Register,
     Rotate,
+    SetNotionApiKey,
 }
 
 impl Screen {
@@ -57,21 +84,32 @@ impl Screen {
         match self {
             Screen::Menu => "CREDENTIAL OPERATIONS",
             Screen::Add => "ADD CREDENTIAL",
+            Screen::AddDetails => "ADD CREDENTIAL · METADATA",
+            Screen::AddSecret => "ADD CREDENTIAL · SECRET",
+            Screen::AddExisting => "SELECT CREDENTIAL",
+            Screen::AddResult => "ADD CREDENTIAL · RESULT",
             Screen::Search => "SEARCH / RETRIEVE",
             Screen::List => "CREDENTIALS",
             Screen::Details => "CREDENTIAL DETAILS",
             Screen::Update => "UPDATE CREDENTIAL REFERENCE",
-            Screen::Register => "REGISTER 1PASSWORD ITEM",
+            Screen::Register => "REGISTER CREDENTIAL",
             Screen::Rotate => "ROTATE CREDENTIAL",
+            Screen::SetNotionApiKey => "STORE NOTION API KEY",
         }
     }
 
     fn hint(self) -> &'static str {
         match self {
             Screen::Menu => "Use ↑ / ↓ to navigate · Enter to open · q to quit",
-            Screen::Add => {
-                "Type to edit · Tab / ↑ / ↓ switches fields · Enter to save · Esc to go back"
+            Screen::Add => "↑ / ↓ to choose · Enter to continue · Esc to go back",
+            Screen::AddDetails => {
+                "Type to edit · Tab / ↑ / ↓ switches fields · Enter to continue · Esc to go back"
             }
+            Screen::AddSecret => {
+                "Type the API secret (hidden) · Enter creates the item · Esc discards and goes back"
+            }
+            Screen::AddExisting => "↑ / ↓ Navigate · Enter select · Esc Back",
+            Screen::AddResult => "Esc Back to menu",
             Screen::Search => "Type to filter · ↑ / ↓ select · Enter view details · Esc to go back",
             Screen::List => "↑ / ↓ Navigate · Enter View details · r Refresh · Esc Back",
             Screen::Details => "↑ / ↓ Scroll · c Copy secret · Esc Back · q Menu",
@@ -82,15 +120,26 @@ impl Screen {
                 "Type to edit · Tab / ↑ / ↓ switches fields · Enter to save · Esc to go back"
             }
             Screen::Rotate => "↑ / ↓ to choose · Enter to rotate · Esc to go back",
+            Screen::SetNotionApiKey => {
+                "Type to edit · Enter to save · Esc to go back"
+            }
         }
     }
 
     fn is_form(self) -> bool {
         matches!(
             self,
-            Screen::Add | Screen::Search | Screen::Update | Screen::Register
+            Screen::AddDetails | Screen::Search | Screen::Update | Screen::Register
         )
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingAction {
+    CopySecret,
+    LoadItems,
+    CreateItem,
+    RegisterExisting { item_id: String, item_title: String },
 }
 
 struct Form {
@@ -148,11 +197,17 @@ struct Dashboard {
     search_selected: usize,
     details_offset: usize,
     details_origin: Screen,
-    copy_requested: bool,
+    pending_action: Option<PendingAction>,
+    add_choice: usize,
+    secret_input: String,
+    items: Vec<SecretItem>,
+    item_selected: usize,
+    result_lines: Vec<String>,
+    database: Database,
 }
 
 impl Dashboard {
-    fn new() -> Self {
+    fn new(database: Database) -> Self {
         Self {
             screen: Screen::Menu,
             selected: 0,
@@ -163,12 +218,18 @@ impl Dashboard {
             search_selected: 0,
             details_offset: 0,
             details_origin: Screen::List,
-            copy_requested: false,
+            pending_action: None,
+            add_choice: 0,
+            secret_input: String::new(),
+            items: Vec::new(),
+            item_selected: 0,
+            result_lines: Vec::new(),
+            database,
         }
     }
 
     fn load_credentials(&mut self) -> bool {
-        match crate::notion::list_credentials() {
+        match crate::notion::list_credentials(&self.database) {
             Ok(credentials) => {
                 self.credentials = credentials;
                 self.selected_credential = 0;
@@ -186,10 +247,18 @@ impl Dashboard {
         self.screen = screen;
         self.status = screen.hint().to_string();
         self.form = match screen {
-            Screen::Add => Form::new(&["Name", "Service", "Username", "Description"]),
+            Screen::Add => {
+                self.add_choice = 0;
+                self.secret_input.clear();
+                self.items.clear();
+                self.item_selected = 0;
+                Form::new(&[])
+            }
+            Screen::AddDetails => Form::new(&ADD_FIELDS),
             Screen::Search => Form::new(&["Query"]),
-            Screen::Update => Form::new(&["Credential name", "New 1Password reference"]),
-            Screen::Register => Form::new(&["1Password item", "Notion name"]),
+            Screen::Update => Form::new(&["Credential name", "New credential reference"]),
+            Screen::Register => Form::new(&["Existing credential", "Notion name"]),
+            Screen::SetNotionApiKey => Form::new(&["Notion API Key"]),
             _ => Form::new(&[]),
         };
 
@@ -213,6 +282,9 @@ impl Dashboard {
     fn back_to_menu(&mut self) {
         self.screen = Screen::Menu;
         self.form = Form::new(&[]);
+        self.secret_input.clear();
+        self.items.clear();
+        self.result_lines.clear();
     }
 
     fn search_indices(&self) -> Vec<usize> {
@@ -265,8 +337,157 @@ impl Dashboard {
         self.status = format!("Selected: {}", self.credentials[next].name);
     }
 
-    fn take_copy_request(&mut self) -> bool {
-        std::mem::take(&mut self.copy_requested)
+    fn take_pending_action(&mut self) -> Option<PendingAction> {
+        self.pending_action.take()
+    }
+
+    fn perform_action(&mut self, action: PendingAction) {
+        match action {
+            PendingAction::CopySecret => self.copy_selected_secret(),
+            PendingAction::LoadItems => self.load_items(),
+            PendingAction::CreateItem => self.create_new_credential(),
+            PendingAction::RegisterExisting {
+                item_id,
+                item_title,
+            } => self.register_existing(&item_id, &item_title),
+        }
+    }
+
+    fn select_add_choice(&mut self, delta: isize) {
+        let last = ADD_CHOICES.len() - 1;
+        self.add_choice = (self.add_choice as isize + delta).clamp(0, last as isize) as usize;
+        self.status = format!("Selected: {}", ADD_CHOICES[self.add_choice]);
+    }
+
+    fn select_item(&mut self, delta: isize) {
+        if self.items.is_empty() {
+            return;
+        }
+        let last = self.items.len() - 1;
+        self.item_selected = (self.item_selected as isize + delta).clamp(0, last as isize) as usize;
+        self.status = format!("Selected: {}", self.items[self.item_selected].title);
+    }
+
+    fn load_items(&mut self) {
+        match self.database.list_items() {
+            Ok(items) => {
+                self.items = items;
+                self.item_selected = 0;
+                self.screen = Screen::AddExisting;
+                self.status = if self.items.is_empty() {
+                    "No credentials found in database.".to_string()
+                } else {
+                    format!(
+                        "Found {} credentials. Select one with ↑ / ↓ and press Enter.",
+                        self.items.len()
+                    )
+                };
+            }
+            Err(error) => {
+                self.status = format!("Could not list credentials: {error:#}");
+            }
+        }
+    }
+
+    fn create_new_credential(&mut self) {
+        let name = self.form.value(0).trim().to_string();
+
+        let mut secret = std::mem::take(&mut self.secret_input);
+        let item_id = match self.database.create_item(&name, None, &secret) {
+            Ok(id) => id,
+            Err(error) => {
+                self.screen = Screen::AddSecret;
+                secret.clear();
+                drop(secret);
+                self.status = format!(
+                    "Credential creation failed. No Notion entry was created. ({error:#})"
+                );
+                return;
+            }
+        };
+        secret.clear();
+        drop(secret);
+
+        // Use sqlite://<id> as the reference format for SQLite-stored credentials
+        let reference = format!("sqlite://{}", item_id);
+
+        let credential = self.credential_from_form(reference.clone());
+
+        match create_credential(&credential, &self.database) {
+            Ok(()) => {
+                self.finish_add();
+                self.status = format!("Created '{name}' in database and registered it in Notion.");
+            }
+            Err(error) => {
+                self.show_add_result(vec![
+                    "The credential was created, but Notion registration failed.".to_string(),
+                    String::new(),
+                    format!("Credential     {name}"),
+                    format!("Database ID    {item_id}"),
+                    format!("Reference      {reference}"),
+                    format!("Error          {error:#}"),
+                    String::new(),
+                    "Retry Notion registration using the reference above.".to_string(),
+                ]);
+            }
+        }
+    }
+
+    fn register_existing(&mut self, item_id: &str, item_title: &str) {
+        // Use sqlite://<id> as the reference format for SQLite-stored credentials
+        let reference = format!("sqlite://{}", item_id);
+
+        let credential = self.credential_from_form(reference.clone());
+        let name = credential.name.clone();
+
+        match create_credential(&credential, &self.database) {
+            Ok(()) => {
+                self.finish_add();
+                self.status =
+                    format!("Registered '{name}' with existing credential '{item_title}'.");
+            }
+            Err(error) => {
+                self.show_add_result(vec![
+                    "The existing credential was left unchanged, but Notion registration failed."
+                        .to_string(),
+                    String::new(),
+                    format!("Credential     {name}"),
+                    format!("Existing item  {item_title}"),
+                    format!("Reference      {reference}"),
+                    format!("Error          {error:#}"),
+                    String::new(),
+                    "Retry Notion registration using the reference above.".to_string(),
+                ]);
+            }
+        }
+    }
+
+    fn show_add_result(&mut self, lines: Vec<String>) {
+        self.finish_add();
+        self.result_lines = lines;
+        self.screen = Screen::AddResult;
+        self.status = Screen::AddResult.hint().to_string();
+    }
+
+    fn finish_add(&mut self) {
+        self.back_to_menu();
+        self.status = Screen::Menu.hint().to_string();
+        self.add_choice = 0;
+    }
+
+    fn credential_from_form(&self, reference: String) -> NewCredential {
+        NewCredential {
+            name: self.form.value(0).trim().to_string(),
+            purpose: self.form.value(1).trim().to_string(),
+            credential_reference: reference,
+            environment_variable: self.form.value(2).trim().to_string(),
+            environment: self.form.value(3).trim().to_string(),
+            repository: self.form.value(4).trim().to_string(),
+            owner: self.form.value(5).trim().to_string(),
+            rotation_frequency: self.form.value(6).trim().to_string(),
+            last_rotated: optional_value(self.form.value(7)),
+            next_rotation_due: optional_value(self.form.value(8)),
+        }
     }
 
     fn copy_selected_secret(&mut self) {
@@ -282,14 +503,14 @@ impl Dashboard {
             .filter(|reference| !reference.is_empty());
 
         let Some(reference) = reference else {
-            self.status = "No 1Password reference configured for this credential.".to_string();
+            self.status = "No credential reference configured for this credential.".to_string();
             return;
         };
 
-        match crate::onepassword::client::copy_secret_to_clipboard(reference) {
+        match self.database.copy_secret_to_clipboard(reference) {
             Ok(()) => self.status = "Secret copied to clipboard.".to_string(),
-            Err(_) => {
-                self.status = "Could not copy the credential to the clipboard.".to_string();
+            Err(error) => {
+                self.status = format!("Could not copy credential: {error:#}");
             }
         }
     }
@@ -325,35 +546,75 @@ impl Dashboard {
                 }
             }
             Screen::Add => {
-                let name = self.form.value(0).trim().to_string();
-                if name.is_empty() {
-                    self.status = "Name is required.".to_string();
+                if self.form.fields.len() != ADD_FIELDS.len() {
+                    self.form = Form::new(&ADD_FIELDS);
+                }
+                self.screen = Screen::AddDetails;
+                self.status = Screen::AddDetails.hint().to_string();
+            }
+            Screen::AddDetails => {
+                for (index, label) in ADD_FIELDS.iter().take(REQUIRED_ADD_FIELDS).enumerate() {
+                    if self.form.value(index).trim().is_empty() {
+                        self.status = format!("{label} is required.");
+                        return;
+                    }
+                }
+
+                for index in [7, 8] {
+                    let value = self.form.value(index).trim();
+                    if !value.is_empty() && !is_date_like(value) {
+                        self.status = format!("{} must use YYYY-MM-DD format.", ADD_FIELDS[index]);
+                        return;
+                    }
+                }
+
+                if self.add_choice == 0 {
+                    self.screen = Screen::AddSecret;
+                    self.status = Screen::AddSecret.hint().to_string();
+                } else {
+                    self.pending_action = Some(PendingAction::LoadItems);
+                    self.status = "Loading credentials from database…".to_string();
+                }
+            }
+            Screen::AddSecret => {
+                if self.secret_input.is_empty() {
+                    self.status = "The API secret is required.".to_string();
                     return;
                 }
-                self.status = format!(
-                    "Add Credential: '{name}' is ready, but Notion/1Password are not connected yet."
-                );
-                self.back_to_menu();
+                self.pending_action = Some(PendingAction::CreateItem);
+                self.status = "Creating the credential and the Notion entry…".to_string();
+            }
+            Screen::AddExisting => {
+                if self.items.is_empty() {
+                    self.status = "No credentials available to select.".to_string();
+                    return;
+                }
+                let index = self.item_selected.min(self.items.len() - 1);
+                let item = self.items[index].clone();
+                self.pending_action = Some(PendingAction::RegisterExisting {
+                    item_id: item.id,
+                    item_title: item.title,
+                });
+                self.status = "Registering the selected credential in Notion…".to_string();
             }
             Screen::Update => {
                 let name = self.form.value(0).trim().to_string();
                 let reference = self.form.value(1).trim().to_string();
                 if name.is_empty() || reference.is_empty() {
-                    self.status =
-                        "Credential name and 1Password reference are required.".to_string();
+                    self.status = "Credential name and reference are required.".to_string();
                     return;
                 }
-                self.status = format!("Update '{name}': Notion/1Password are not connected yet.");
+                self.status = format!("Update '{name}': Notion/database are not connected yet.");
                 self.back_to_menu();
             }
             Screen::Register => {
                 let item = self.form.value(0).trim().to_string();
                 let name = self.form.value(1).trim().to_string();
                 if item.is_empty() || name.is_empty() {
-                    self.status = "1Password item and Notion name are required.".to_string();
+                    self.status = "Credential and Notion name are required.".to_string();
                     return;
                 }
-                self.status = format!("Register '{name}': Notion/1Password are not connected yet.");
+                self.status = format!("Register '{name}': Notion/database are not connected yet.");
                 self.back_to_menu();
             }
             Screen::Rotate => {
@@ -363,9 +624,26 @@ impl Dashboard {
                 }
                 let index = self.selected_credential.min(self.credentials.len() - 1);
                 let name = self.credentials[index].name.clone();
-                self.status = format!("Rotate '{name}': Notion/1Password are not connected yet.");
+                self.status = format!("Rotate '{name}': Notion/database are not connected yet.");
+            }
+            Screen::SetNotionApiKey => {
+                let key = self.form.value(0).trim();
+                if key.is_empty() {
+                    self.status = "Notion API Key is required.".to_string();
+                    return;
+                }
+                match self.database.set_notion_api_key(key) {
+                    Ok(()) => {
+                        self.back_to_menu();
+                        self.status = "Notion API Key stored successfully.".to_string();
+                    }
+                    Err(error) => {
+                        self.status = format!("Failed to store Notion API Key: {error:#}");
+                    }
+                }
             }
             Screen::Details => {}
+            Screen::AddResult => {}
         }
     }
 
@@ -375,18 +653,34 @@ impl Dashboard {
         }
 
         match code {
-            KeyCode::Esc => {
-                if self.screen == Screen::Details {
+            KeyCode::Esc => match self.screen {
+                Screen::Details => {
                     self.screen = match self.details_origin {
                         Screen::Search => Screen::Search,
                         _ => Screen::List,
                     };
                     self.status = self.screen.hint().to_string();
-                } else {
+                }
+                Screen::AddSecret => {
+                    self.secret_input.clear();
+                    self.screen = Screen::AddDetails;
+                    self.status = "Secret entry cancelled. The secret was discarded.".to_string();
+                }
+                Screen::AddExisting => {
+                    self.items.clear();
+                    self.screen = Screen::AddDetails;
+                    self.status = Screen::AddDetails.hint().to_string();
+                }
+                Screen::AddDetails => {
+                    self.secret_input.clear();
+                    self.screen = Screen::Add;
+                    self.status = Screen::Add.hint().to_string();
+                }
+                _ => {
                     self.back_to_menu();
                     self.status = Screen::Menu.hint().to_string();
                 }
-            }
+            },
             KeyCode::Tab => {
                 if self.screen.is_form() {
                     self.form.next();
@@ -397,30 +691,30 @@ impl Dashboard {
                     self.form.previous();
                 }
             }
-            KeyCode::Up => {
-                if self.screen == Screen::Search {
-                    self.select_search_result(-1);
-                } else if self.screen.is_form() {
-                    self.form.previous();
-                } else if self.screen == Screen::Details {
-                    self.details_offset = self.details_offset.saturating_sub(1);
-                } else {
-                    self.select_credential(-1);
-                }
-            }
-            KeyCode::Down => {
-                if self.screen == Screen::Search {
-                    self.select_search_result(1);
-                } else if self.screen.is_form() {
-                    self.form.next();
-                } else if self.screen == Screen::Details {
-                    self.details_offset += 1;
-                } else {
-                    self.select_credential(1);
-                }
-            }
+            KeyCode::Up => match self.screen {
+                Screen::Search => self.select_search_result(-1),
+                Screen::Add => self.select_add_choice(-1),
+                Screen::AddExisting => self.select_item(-1),
+                Screen::Details => self.details_offset = self.details_offset.saturating_sub(1),
+                Screen::AddSecret => {}
+                Screen::AddResult => {}
+                _ if self.screen.is_form() => self.form.previous(),
+                _ => self.select_credential(-1),
+            },
+            KeyCode::Down => match self.screen {
+                Screen::Search => self.select_search_result(1),
+                Screen::Add => self.select_add_choice(1),
+                Screen::AddExisting => self.select_item(1),
+                Screen::Details => self.details_offset += 1,
+                Screen::AddSecret => {}
+                Screen::AddResult => {}
+                _ if self.screen.is_form() => self.form.next(),
+                _ => self.select_credential(1),
+            },
             KeyCode::Backspace => {
-                if self.screen.is_form() {
+                if self.screen == Screen::AddSecret {
+                    self.secret_input.pop();
+                } else if self.screen.is_form() {
                     self.form.backspace();
                     if self.screen == Screen::Search {
                         self.search_selected = 0;
@@ -428,7 +722,9 @@ impl Dashboard {
                 }
             }
             KeyCode::Char(character) => {
-                if self.screen.is_form() {
+                if self.screen == Screen::AddSecret {
+                    self.secret_input.push(character);
+                } else if self.screen.is_form() {
                     self.form.push(character);
                     if self.screen == Screen::Search {
                         self.search_selected = 0;
@@ -441,7 +737,7 @@ impl Dashboard {
                         );
                     }
                 } else if self.screen == Screen::Details && (character == 'c' || character == 'C') {
-                    self.copy_requested = true;
+                    self.pending_action = Some(PendingAction::CopySecret);
                 } else if character == 'q' || character == 'Q' {
                     self.back_to_menu();
                     self.status = Screen::Menu.hint().to_string();
@@ -471,6 +767,7 @@ impl Dashboard {
                     3 => Screen::Update,
                     4 => Screen::Register,
                     5 => Screen::Rotate,
+                    6 => Screen::SetNotionApiKey,
                     _ => return true,
                 };
                 self.open(screen);
@@ -523,11 +820,15 @@ impl Dashboard {
                     None,
                 );
             }
-            Screen::Add => self.render_form(
+            Screen::Add => self.render_add_choice(frame, layout[1]),
+            Screen::AddDetails => self.render_form(
                 frame,
                 layout[1],
-                "Secrets stay in 1Password; Notion stores metadata.",
+                "Secrets stay in local SQLite database; Notion stores metadata.",
             ),
+            Screen::AddSecret => self.render_secret(frame, layout[1]),
+            Screen::AddExisting => self.render_add_existing(frame, layout[1]),
+            Screen::AddResult => self.render_add_result(frame, layout[1]),
             Screen::Search => self.render_search(frame, layout[1]),
             Screen::List => {
                 let items = credential_items(&self.credentials);
@@ -546,12 +847,12 @@ impl Dashboard {
             Screen::Update => self.render_form(
                 frame,
                 layout[1],
-                "Enter the credential name and the new 1Password reference.",
+                "Enter the credential name and the new credential reference.",
             ),
             Screen::Register => self.render_form(
                 frame,
                 layout[1],
-                "Link an existing 1Password item without re-entering secrets.",
+                "Link an existing credential without re-entering secrets.",
             ),
             Screen::Rotate => {
                 let items = credential_items(&self.credentials);
@@ -564,6 +865,11 @@ impl Dashboard {
                     Some("No credentials available to rotate."),
                 );
             }
+            Screen::SetNotionApiKey => self.render_form(
+                frame,
+                layout[1],
+                "Enter your Notion API key. It will be stored in the local SQLite database.",
+            ),
         }
 
         render_status(frame, layout[2], &self.status);
@@ -581,6 +887,122 @@ impl Dashboard {
             Paragraph::new(lines)
                 .style(Style::default().bg(PANEL_BG))
                 .block(panel(self.screen.title())),
+            area,
+        );
+    }
+
+    fn render_add_choice(&self, frame: &mut Frame, area: Rect) {
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(3)])
+            .split(area);
+
+        let prompt = Paragraph::new(Line::from(Span::styled(
+            "  How would you like to store this credential?",
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        )))
+        .style(Style::default().bg(PANEL_BG))
+        .block(panel(self.screen.title()));
+
+        frame.render_widget(prompt, sections[0]);
+
+        let items = ADD_CHOICES
+            .iter()
+            .map(|choice| ListItem::new(format!("  {choice}")))
+            .collect();
+
+        render_selectable_list(
+            frame,
+            sections[1],
+            "STORAGE OPTION",
+            items,
+            self.add_choice,
+            None,
+        );
+    }
+
+    fn render_secret(&self, frame: &mut Frame, area: Rect) {
+        let name = self.form.value(0).trim();
+
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("  Credential  ", Style::default().fg(MUTED)),
+                Span::styled(
+                    name.to_string(),
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Secret      ", Style::default().fg(MUTED)),
+                Span::styled(
+                    "••••••••",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("▌", Style::default().fg(ACCENT)),
+                Span::styled("  (hidden)", Style::default().fg(MUTED)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  The secret is never rendered, logged, or sent to Notion.",
+                Style::default().fg(MUTED),
+            )),
+            Line::from(Span::styled(
+                "  It is discarded immediately after the create attempt.",
+                Style::default().fg(MUTED),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Enter to create · Esc to cancel and discard",
+                Style::default().fg(ACCENT),
+            )),
+        ];
+
+        frame.render_widget(
+            Paragraph::new(lines)
+                .style(Style::default().bg(PANEL_BG))
+                .block(accent_panel(self.screen.title())),
+            area,
+        );
+    }
+
+    fn render_add_existing(&self, frame: &mut Frame, area: Rect) {
+        let items = self
+            .items
+            .iter()
+            .map(|item| {
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("  {:<36}", truncate(&item.title, 36)),
+                        Style::default().fg(TEXT),
+                    ),
+                    Span::styled(format!("  {}", item.id), Style::default().fg(MUTED)),
+                ]))
+            })
+            .collect();
+
+        render_selectable_list(
+            frame,
+            area,
+            self.screen.title(),
+            items,
+            self.item_selected,
+            Some("No credentials found in database."),
+        );
+    }
+
+    fn render_add_result(&self, frame: &mut Frame, area: Rect) {
+        let lines: Vec<Line<'static>> = self
+            .result_lines
+            .iter()
+            .map(|line| Line::from(Span::styled(format!("  {line}"), Style::default().fg(TEXT))))
+            .collect();
+
+        frame.render_widget(
+            Paragraph::new(lines)
+                .style(Style::default().bg(PANEL_BG).fg(TEXT))
+                .block(accent_panel(self.screen.title()))
+                .wrap(Wrap { trim: false }),
             area,
         );
     }
@@ -750,6 +1172,9 @@ impl Dashboard {
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let settings = crate::config::Settings::load()?;
+    let database = Database::open(&settings.db_path)?;
+
     enable_raw_mode()?;
 
     let mut stdout = io::stdout();
@@ -758,7 +1183,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = show_dashboard(&mut terminal);
+    let result = show_dashboard(&mut terminal, database);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -784,8 +1209,9 @@ fn resume_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
 
 fn show_dashboard(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    database: Database,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut dashboard = Dashboard::new();
+    let mut dashboard = Dashboard::new(database);
 
     loop {
         terminal.draw(|frame| dashboard.render(frame))?;
@@ -799,9 +1225,9 @@ fn show_dashboard(
                 break;
             }
 
-            if dashboard.take_copy_request() {
+            if let Some(action) = dashboard.take_pending_action() {
                 suspend_tui(terminal)?;
-                dashboard.copy_selected_secret();
+                dashboard.perform_action(action);
                 resume_tui(terminal)?;
                 terminal.draw(|frame| dashboard.render(frame))?;
             }
@@ -855,7 +1281,7 @@ fn render_header(frame: &mut Frame, area: Rect) {
             Style::default().fg(TEXT),
         )),
         Line::from(Span::styled(
-            "Secrets stay in 1Password; Notion stores metadata.",
+            "Secrets stay in local SQLite database; Notion stores metadata.",
             Style::default().fg(MUTED),
         )),
     ];
@@ -865,7 +1291,7 @@ fn render_header(frame: &mut Frame, area: Rect) {
         .block(
             Block::default()
                 .title(Line::from(Span::styled(
-                    " NOTION + 1PASSWORD ",
+                    " NOTION + SQLITE ",
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 )))
                 .borders(Borders::ALL)
@@ -948,6 +1374,31 @@ fn detail_line(label: &str, value: Option<&str>, width: usize) -> Line<'static> 
     ])
 }
 
+fn optional_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn is_date_like(value: &str) -> bool {
+    let bytes = value.as_bytes();
+
+    if bytes.len() < 10 {
+        return false;
+    }
+
+    let date_is_shaped = bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..10].iter().all(u8::is_ascii_digit);
+
+    date_is_shaped && (bytes.len() == 10 || bytes[10] == b'T')
+}
+
 fn truncate(value: &str, max: usize) -> String {
     if value.chars().count() <= max {
         value.to_string()
@@ -1014,4 +1465,216 @@ fn form_lines(form: &Form, visible_rows: usize) -> Vec<Line<'static>> {
             Line::from(spans)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    fn test_database() -> Database {
+        let file = NamedTempFile::new().expect("failed to create temp file");
+        Database::open(file.path()).expect("failed to open test database")
+    }
+
+    fn filled_dashboard() -> Dashboard {
+        let database = test_database();
+        let mut dashboard = Dashboard::new(database);
+        dashboard.open(Screen::Add);
+        dashboard.submit();
+
+        let values = [
+            "Test Credential",
+            "Testing",
+            "TEST_API_KEY",
+            "Local",
+            "example/repo",
+            "Owner",
+            "Every 90 days",
+        ];
+
+        for (index, value) in values.iter().enumerate() {
+            dashboard.form.fields[index].1 = (*value).to_string();
+        }
+
+        dashboard
+    }
+
+    #[test]
+    fn add_defaults_to_create_new() {
+        let mut dashboard = Dashboard::new(test_database());
+        dashboard.open(Screen::Add);
+
+        assert_eq!(dashboard.add_choice, 0);
+        assert_eq!(ADD_CHOICES[0], "Create a new credential");
+
+        dashboard.submit();
+        assert_eq!(dashboard.screen, Screen::AddDetails);
+    }
+
+    #[test]
+    fn create_path_advances_to_secret_entry() {
+        let mut dashboard = filled_dashboard();
+
+        dashboard.submit();
+
+        assert_eq!(dashboard.screen, Screen::AddSecret);
+        assert!(dashboard.pending_action.is_none());
+    }
+
+    #[test]
+    fn create_path_requires_each_required_field() {
+        let mut dashboard = filled_dashboard();
+        dashboard.form.fields[0].1.clear();
+
+        dashboard.submit();
+
+        assert_eq!(dashboard.screen, Screen::AddDetails);
+        assert_eq!(dashboard.status, "Name is required.");
+    }
+
+    #[test]
+    fn secret_input_is_not_echoed_or_stored_in_the_form() {
+        let mut dashboard = filled_dashboard();
+        dashboard.submit();
+
+        for character in "super-secret".chars() {
+            dashboard.handle_key(KeyCode::Char(character));
+        }
+
+        assert_eq!(dashboard.secret_input, "super-secret");
+        assert!(!dashboard.status.contains("super-secret"));
+        assert_eq!(dashboard.form.value(0), "Test Credential");
+    }
+
+    #[test]
+    fn cancelling_secret_entry_discards_it() {
+        let mut dashboard = filled_dashboard();
+        dashboard.submit();
+        dashboard.handle_key(KeyCode::Char('x'));
+
+        dashboard.handle_key(KeyCode::Esc);
+
+        assert_eq!(dashboard.screen, Screen::AddDetails);
+        assert!(dashboard.secret_input.is_empty());
+        assert_eq!(dashboard.form.value(0), "Test Credential");
+    }
+
+    #[test]
+    fn confirming_secret_requests_creation_without_running_it() {
+        let mut dashboard = filled_dashboard();
+        dashboard.submit();
+        dashboard.handle_key(KeyCode::Char('x'));
+
+        dashboard.handle_key(KeyCode::Enter);
+
+        assert_eq!(dashboard.pending_action, Some(PendingAction::CreateItem));
+        assert_eq!(dashboard.secret_input, "x");
+    }
+
+    #[test]
+    fn existing_path_requests_item_listing() {
+        let mut dashboard = filled_dashboard();
+        dashboard.add_choice = 1;
+
+        dashboard.submit();
+
+        assert_eq!(dashboard.pending_action, Some(PendingAction::LoadItems));
+    }
+
+    #[test]
+    fn existing_path_registers_the_highlighted_item() {
+        let mut dashboard = filled_dashboard();
+        dashboard.add_choice = 1;
+        dashboard.screen = Screen::AddExisting;
+        dashboard.items = vec![
+            SecretItem {
+                id: "one".into(),
+                title: "First".into(),
+            },
+            SecretItem {
+                id: "two".into(),
+                title: "Second".into(),
+            },
+        ];
+        dashboard.select_item(1);
+
+        dashboard.submit();
+
+        assert_eq!(
+            dashboard.pending_action,
+            Some(PendingAction::RegisterExisting {
+                item_id: "two".into(),
+                item_title: "Second".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn escaping_the_choice_screen_returns_to_the_menu() {
+        let mut dashboard = Dashboard::new(test_database());
+        dashboard.open(Screen::Add);
+
+        dashboard.handle_key(KeyCode::Esc);
+
+        assert_eq!(dashboard.screen, Screen::Menu);
+    }
+
+    #[test]
+    fn result_screen_clears_the_collected_secret() {
+        let mut dashboard = filled_dashboard();
+        dashboard.submit();
+        dashboard.handle_key(KeyCode::Char('s'));
+
+        dashboard.show_add_result(vec!["Partial failure details".into()]);
+
+        assert_eq!(dashboard.screen, Screen::AddResult);
+        assert!(dashboard.secret_input.is_empty());
+        assert_eq!(dashboard.result_lines, ["Partial failure details"]);
+
+        dashboard.handle_key(KeyCode::Esc);
+
+        assert_eq!(dashboard.screen, Screen::Menu);
+        assert!(dashboard.result_lines.is_empty());
+    }
+
+    #[test]
+    fn date_validation_accepts_iso_shapes_only() {
+        assert!(is_date_like("2026-01-01"));
+        assert!(is_date_like("2026-01-01T10:00:00Z"));
+        assert!(!is_date_like("01/02/2026"));
+        assert!(!is_date_like("2026-1-1"));
+        assert!(!is_date_like("2026-01-01 10:00"));
+    }
+
+    #[test]
+    fn invalid_optional_date_blocks_the_flow() {
+        let mut dashboard = filled_dashboard();
+        dashboard.form.fields[7].1 = "next tuesday".into();
+
+        dashboard.submit();
+
+        assert_eq!(dashboard.screen, Screen::AddDetails);
+        assert_eq!(dashboard.status, "Last Rotated must use YYYY-MM-DD format.");
+    }
+
+    #[test]
+    fn metadata_maps_optional_dates_only_when_present() {
+        let dashboard = filled_dashboard();
+
+        let credential = dashboard.credential_from_form("sqlite://vault/item/credential".into());
+
+        assert_eq!(credential.name, "Test Credential");
+        assert_eq!(credential.environment_variable, "TEST_API_KEY");
+        assert_eq!(credential.environment, "Local");
+        assert!(credential.last_rotated.is_none());
+        assert!(credential.next_rotation_due.is_none());
+
+        let mut dashboard = filled_dashboard();
+        dashboard.form.fields[7].1 = "2026-01-01".into();
+
+        let credential = dashboard.credential_from_form("sqlite://vault/item/credential".into());
+
+        assert_eq!(credential.last_rotated.as_deref(), Some("2026-01-01"));
+    }
 }
