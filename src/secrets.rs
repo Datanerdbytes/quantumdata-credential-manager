@@ -179,6 +179,11 @@ impl Database {
 
         Ok(())
     }
+
+    pub fn delete_item_by_reference(&self, reference: &str) -> Result<()> {
+        let db_id = reference.strip_prefix("sqlite://").unwrap_or(reference);
+        self.delete_item(db_id)
+    }
 }
 
 fn copy_to_clipboard(text: &str) -> Result<()> {

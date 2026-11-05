@@ -682,15 +682,15 @@ impl Dashboard {
             return;
         }
         let index = self.selected_credential.min(self.credentials.len() - 1);
-        let id = match &self.credentials[index].id {
-            Some(id) => id.clone(),
+        let reference = match &self.credentials[index].credential_reference {
+            Some(ref_) => ref_.clone(),
             None => {
-                self.status = "Credential has no ID to delete.".to_string();
+                self.status = "Credential has no reference to delete.".to_string();
                 return;
             }
         };
         let name = self.credentials[index].name.clone();
-        match self.database.delete_item(&id) {
+        match self.database.delete_item_by_reference(&reference) {
             Ok(()) => {
                 self.status = format!("Deleted '{name}' from database.");
                 self.load_credentials();
