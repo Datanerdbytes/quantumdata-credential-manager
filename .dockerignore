@@ -1,0 +1,12 @@
+target/
+credentials.db
+*.db
+.env
+.git/
+.gitignore
+add-credential-report.md
+onepassword-retrieval-report.md
+README.md
+pyproject.toml
+.python-version
+**/target/

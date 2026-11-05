@@ -1,0 +1,15 @@
+version: "3.8"
+
+services:
+  notion-api-credential-manager:
+    build: .
+    container_name: notion-api-credential-manager
+    stdin_open: true
+    tty: true
+    environment:
+      - NOTION_DATA_SOURCE_ID=${NOTION_DATA_SOURCE_ID}
+      - DB_PATH=/app/credentials.db
+    volumes:
+      - ./credentials.db:/app/credentials.db
+    # Clipboard (pbcopy) won't work inside the container.
+    # Everything else (list, create, retrieve, copy-to-clipboard is macOS-only) works normally.
