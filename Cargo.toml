@@ -9,7 +9,10 @@ name = "api-manager"
 path = "src/main.rs"
 
 [dependencies]
+aes-gcm = "0.10.3"
 anyhow = "1.0.104"
+base64 = "0.22.1"
+chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
 clap = { version = "4.6.7", features = ["derive"] }
 crossterm = "0.29.0"
 dotenvy = "0.15.7"

@@ -1,8 +1,22 @@
 use anyhow::{Context, Result, anyhow};
-use rusqlite::{Connection, params};
-use std::path::Path;
+use rusqlite::{Connection, OptionalExtension, params};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use crate::crypto::{Cipher, Key, is_encrypted};
 
 const NOTION_API_KEY_ID: &str = "notion-api-key";
+const ENCRYPTION_MARKER: &str = "encryption";
+const ENCRYPTION_VERSION: &str = "v1";
+const STDOUT_FALLBACK_ENV: &str = "QUANTUMDATA_ALLOW_STDOUT_SECRET";
+
+pub const CLIPBOARD_CLEAR_SECONDS: u64 = 45;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyOutcome {
+    Clipboard,
+    Stdout,
+}
 
 #[derive(Debug, Clone)]
 pub struct SecretItem {
@@ -12,15 +26,143 @@ pub struct SecretItem {
 
 pub struct Database {
     connection: Connection,
+    cipher: Option<Cipher>,
+    key: Option<Key>,
+    path: PathBuf,
 }
 
 impl Database {
+    #[cfg(test)]
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_inner(path, None)
+    }
+
+    pub fn open_with_key(path: &Path, key: Key) -> Result<Self> {
+        Self::open_inner(path, Some(key))
+    }
+
+    pub fn open_with_optional_key(path: &Path, key: Option<Key>) -> Result<Self> {
+        Self::open_inner(path, key)
+    }
+
+    fn open_inner(path: &Path, key: Option<Key>) -> Result<Self> {
         let connection = Connection::open(path)
             .with_context(|| format!("Failed to open SQLite database at {}", path.display()))?;
-        let database = Self { connection };
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .context("Failed to configure the SQLite busy timeout")?;
+
+        let database = Self {
+            connection,
+            cipher: key.as_ref().map(Cipher::new),
+            key,
+            path: path.to_path_buf(),
+        };
         database.migrate()?;
+
+        if database.cipher.is_some() {
+            database.encrypt_plaintext_rows()?;
+        } else if database.get_meta(ENCRYPTION_MARKER)?.is_some() {
+            return Err(anyhow!(
+                "The SQLite database at {} is encrypted. Start the app normally so it can load the master key.",
+                path.display()
+            ));
+        }
+
         Ok(database)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn key(&self) -> Option<Key> {
+        self.key
+    }
+
+    fn encrypt(&self, value: &str) -> Result<String> {
+        match &self.cipher {
+            Some(cipher) => cipher.encrypt(value),
+            None => Ok(value.to_string()),
+        }
+    }
+
+    fn decrypt(&self, stored: &str) -> Result<String> {
+        match &self.cipher {
+            Some(cipher) if is_encrypted(stored) => cipher.decrypt(stored),
+            Some(_) => Ok(stored.to_string()),
+            None if is_encrypted(stored) => Err(anyhow!(
+                "The stored value is encrypted but no master key is loaded."
+            )),
+            None => Ok(stored.to_string()),
+        }
+    }
+
+    fn encrypt_plaintext_rows(&self) -> Result<()> {
+        let Some(cipher) = self.cipher.as_ref() else {
+            return Ok(());
+        };
+
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .context("Failed to start the encryption migration")?;
+
+        let secrets: Vec<(String, String)> = {
+            let mut statement = transaction
+                .prepare("SELECT id, secret FROM secrets")
+                .context("Failed to prepare the encryption migration")?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .context("Failed to read secrets for encryption")?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .context("Failed to read secrets for encryption")?
+        };
+
+        for (id, secret) in secrets {
+            if is_encrypted(&secret) {
+                continue;
+            }
+            transaction
+                .execute(
+                    "UPDATE secrets SET secret = ? WHERE id = ?",
+                    params![cipher.encrypt(&secret)?, id],
+                )
+                .context("Failed to encrypt a stored secret")?;
+        }
+
+        if let Some(stored) = transaction
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?",
+                params![NOTION_API_KEY_ID],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .context("Failed to read the Notion API key for encryption")?
+        {
+            if !is_encrypted(&stored) {
+                transaction
+                    .execute(
+                        "UPDATE meta SET value = ? WHERE key = ?",
+                        params![cipher.encrypt(&stored)?, NOTION_API_KEY_ID],
+                    )
+                    .context("Failed to encrypt the Notion API key")?;
+            }
+        }
+
+        transaction
+            .execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![ENCRYPTION_MARKER, ENCRYPTION_VERSION],
+            )
+            .context("Failed to record the encryption version")?;
+
+        transaction
+            .commit()
+            .context("Failed to commit the encryption migration")?;
+
+        Ok(())
     }
 
     fn migrate(&self) -> Result<()> {
@@ -77,11 +219,12 @@ impl Database {
         }
 
         let id = uuid::Uuid::new_v4().to_string();
+        let stored = self.encrypt(secret)?;
 
         self.connection
             .execute(
                 "INSERT INTO secrets (id, title, username, secret) VALUES (?, ?, ?, ?)",
-                params![id, title.trim(), username.unwrap_or(""), secret],
+                params![id, title.trim(), username.unwrap_or(""), stored],
             )
             .context("Failed to insert secret into database")?;
 
@@ -94,16 +237,19 @@ impl Database {
             .prepare("SELECT secret FROM secrets WHERE id = ?")
             .context("Failed to prepare secret lookup query")?;
 
-        let mut rows = statement.query_map(params![id], |row| row.get::<_, String>(0))?;
+        let mut rows = statement
+            .query(params![id])
+            .context("Failed to query the secret")?;
 
-        if let Some(row) = rows.next() {
-            return Ok(Some(row.context("Failed to read secret value")?));
+        if let Some(row) = rows.next().context("Failed to read secret value")? {
+            let stored: String = row.get(0).context("Failed to read secret value")?;
+            return self.decrypt(&stored).map(Some);
         }
 
         Ok(None)
     }
 
-    pub fn copy_secret_to_clipboard(&self, reference: &str) -> Result<bool> {
+    pub fn copy_secret_to_clipboard(&self, reference: &str) -> Result<CopyOutcome> {
         // Strip the sqlite:// prefix if present, since the database id column
         // stores only the raw UUID without the scheme prefix.
         let db_id = reference.strip_prefix("sqlite://").unwrap_or(reference);
@@ -120,31 +266,41 @@ impl Database {
             return Err(anyhow!("The Notion API key must not be empty."));
         }
 
-        self.connection
-            .execute(
-                "INSERT INTO meta (key, value) VALUES (?, ?)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![NOTION_API_KEY_ID, key.trim()],
-            )
+        let stored = self.encrypt(key.trim())?;
+        self.set_meta(NOTION_API_KEY_ID, &stored)
             .context("Failed to store the Notion API key")?;
 
         Ok(())
     }
 
     pub fn get_notion_api_key(&self) -> Result<Option<String>> {
+        self.get_meta(NOTION_API_KEY_ID)?
+            .map(|value| self.decrypt(&value))
+            .transpose()
+    }
+
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
         let mut statement = self
             .connection
             .prepare("SELECT value FROM meta WHERE key = ?")
             .context("Failed to prepare meta lookup query")?;
 
-        let mut rows =
-            statement.query_map(params![NOTION_API_KEY_ID], |row| row.get::<_, String>(0))?;
+        statement
+            .query_row(params![key], |row| row.get::<_, String>(0))
+            .optional()
+            .context("Failed to read meta value")
+    }
 
-        if let Some(row) = rows.next() {
-            return Ok(Some(row.context("Failed to read meta value")?));
-        }
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )
+            .context("Failed to store meta value")?;
 
-        Ok(None)
+        Ok(())
     }
 
     pub fn delete_notion_api_key(&self) -> Result<()> {
@@ -185,10 +341,13 @@ impl Database {
         };
 
         match new_secret.filter(|secret| !secret.is_empty()) {
-            Some(secret) => self.connection.execute(
-                "UPDATE secrets SET title = ?, secret = ? WHERE id = ?",
-                params![new_title, secret, id],
-            ),
+            Some(secret) => {
+                let stored = self.encrypt(secret)?;
+                self.connection.execute(
+                    "UPDATE secrets SET title = ?, secret = ? WHERE id = ?",
+                    params![new_title, stored, id],
+                )
+            }
             None => self.connection.execute(
                 "UPDATE secrets SET title = ? WHERE id = ?",
                 params![new_title, id],
@@ -265,7 +424,7 @@ impl Database {
     }
 }
 
-fn copy_to_clipboard(text: &str) -> Result<bool> {
+fn copy_to_clipboard(text: &str) -> Result<CopyOutcome> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
@@ -283,7 +442,8 @@ fn copy_to_clipboard(text: &str) -> Result<bool> {
                 .context("Failed to complete clipboard operation")?;
 
             if status.success() {
-                return Ok(true);
+                schedule_clipboard_clear(text.to_string());
+                return Ok(CopyOutcome::Clipboard);
             }
         }
         Err(_) => {
@@ -291,9 +451,51 @@ fn copy_to_clipboard(text: &str) -> Result<bool> {
         }
     }
 
-    // Fallback: print to stdout so user can copy from terminal output
-    println!("{}", text);
-    Ok(false)
+    if stdout_fallback_enabled(std::env::var(STDOUT_FALLBACK_ENV).ok().as_deref()) {
+        println!("{}", text);
+        return Ok(CopyOutcome::Stdout);
+    }
+
+    Err(anyhow!(
+        "Clipboard unavailable (pbcopy not found). Set {STDOUT_FALLBACK_ENV}=1 to print the secret to stdout instead."
+    ))
+}
+
+fn schedule_clipboard_clear(secret: String) {
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(CLIPBOARD_CLEAR_SECONDS));
+        clear_clipboard_if_unchanged(secret.as_bytes());
+    });
+}
+
+fn clear_clipboard_if_unchanged(secret: &[u8]) {
+    use std::process::{Command, Stdio};
+
+    let Ok(current) = Command::new("pbpaste").output() else {
+        return;
+    };
+
+    if !current.status.success() || current.stdout != secret {
+        return;
+    }
+
+    // Dropping the stdin handle closes it immediately, so pbcopy receives EOF
+    // and replaces the clipboard with an empty string.
+    if let Ok(mut clipboard) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+        drop(clipboard.stdin.take());
+        let _ = clipboard.wait();
+    }
+}
+
+fn stdout_fallback_enabled(value: Option<&str>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes"
+    )
 }
 
 #[cfg(test)]
@@ -304,6 +506,17 @@ mod tests {
         let path = directory.path().join("credentials.db");
         let database = Database::open(&path).expect("failed to open test database");
         (database, directory)
+    }
+
+    #[test]
+    fn stdout_fallback_is_opt_in() {
+        assert!(!stdout_fallback_enabled(None));
+        assert!(!stdout_fallback_enabled(Some("")));
+        assert!(!stdout_fallback_enabled(Some("0")));
+        assert!(!stdout_fallback_enabled(Some("false")));
+        assert!(stdout_fallback_enabled(Some("1")));
+        assert!(stdout_fallback_enabled(Some(" TRUE ")));
+        assert!(stdout_fallback_enabled(Some("yes")));
     }
 
     #[test]
@@ -509,5 +722,180 @@ mod tests {
             .expect_err("deletion should fail");
 
         assert!(error.to_string().contains("No Notion API key found"));
+    }
+
+    fn encrypted_test_database() -> (Database, tempfile::TempDir) {
+        let directory = tempfile::tempdir().expect("failed to create temp directory");
+        let path = directory.path().join("credentials.db");
+        let database =
+            Database::open_with_key(&path, [7u8; 32]).expect("failed to open encrypted database");
+        (database, directory)
+    }
+
+    fn raw_secret(database: &Database, id: &str) -> String {
+        database
+            .connection
+            .query_row(
+                "SELECT secret FROM secrets WHERE id = ?",
+                params![id],
+                |row| row.get(0),
+            )
+            .expect("failed to read raw secret")
+    }
+
+    #[test]
+    fn encrypts_secrets_at_rest() {
+        let (database, _directory) = encrypted_test_database();
+        let id = database
+            .create_item("OpenAI", None, "sk-plaintext")
+            .expect("failed to create item");
+
+        assert_eq!(
+            database.get_secret(&id).expect("failed to read secret"),
+            Some("sk-plaintext".to_string())
+        );
+        let raw = raw_secret(&database, &id);
+        assert!(raw.starts_with("enc:v1:"));
+        assert_ne!(raw, "sk-plaintext");
+    }
+
+    #[test]
+    fn encrypts_notion_api_key_at_rest() {
+        let (database, _directory) = encrypted_test_database();
+        database
+            .set_notion_api_key("secret_notion_token")
+            .expect("failed to set key");
+
+        let raw = database
+            .get_meta("notion-api-key")
+            .expect("failed to read meta")
+            .expect("missing meta value");
+        assert!(raw.starts_with("enc:v1:"));
+        assert_eq!(
+            database.get_notion_api_key().expect("failed to get key"),
+            Some("secret_notion_token".to_string())
+        );
+    }
+
+    #[test]
+    fn migrates_plaintext_rows_when_opened_with_a_key() {
+        let directory = tempfile::tempdir().expect("failed to create temp directory");
+        let path = directory.path().join("credentials.db");
+
+        let id = {
+            let database = Database::open(&path).expect("failed to open plaintext database");
+            let id = database
+                .create_item("OpenAI", None, "secret")
+                .expect("failed to create item");
+            database
+                .set_notion_api_key("notion-token")
+                .expect("failed to set key");
+            id
+        };
+
+        let database = Database::open_with_key(&path, [3u8; 32]).expect("failed to reopen");
+
+        assert_eq!(
+            database.get_secret(&id).expect("failed to read secret"),
+            Some("secret".to_string())
+        );
+        assert_eq!(
+            database.get_notion_api_key().expect("failed to get key"),
+            Some("notion-token".to_string())
+        );
+        assert!(raw_secret(&database, &id).starts_with("enc:v1:"));
+        assert_eq!(
+            database
+                .get_meta("encryption")
+                .expect("failed to read marker")
+                .as_deref(),
+            Some("v1")
+        );
+    }
+
+    #[test]
+    fn reencrypts_plaintext_rows_written_after_migration() {
+        let (database, _directory) = encrypted_test_database();
+        let path = database.path().to_path_buf();
+        let id = database
+            .create_item("OpenAI", None, "secret")
+            .expect("failed to create item");
+        database
+            .connection
+            .execute(
+                "UPDATE secrets SET secret = 'legacy-plain' WHERE id = ?",
+                params![id],
+            )
+            .expect("failed to downgrade a row");
+        drop(database);
+
+        let database = Database::open_with_key(&path, [7u8; 32]).expect("failed to reopen");
+
+        assert!(raw_secret(&database, &id).starts_with("enc:v1:"));
+        assert_eq!(
+            database.get_secret(&id).expect("failed to read secret"),
+            Some("legacy-plain".to_string())
+        );
+    }
+
+    #[test]
+    fn plaintext_open_refuses_an_encrypted_database() {
+        let directory = tempfile::tempdir().expect("failed to create temp directory");
+        let path = directory.path().join("credentials.db");
+
+        {
+            let database =
+                Database::open_with_key(&path, [7u8; 32]).expect("failed to open encrypted db");
+            database
+                .create_item("OpenAI", None, "secret")
+                .expect("failed to create item");
+        }
+
+        let error = match Database::open(&path) {
+            Ok(_) => panic!("plaintext open should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("encrypted"));
+    }
+
+    #[test]
+    fn a_different_key_cannot_decrypt() {
+        let directory = tempfile::tempdir().expect("failed to create temp directory");
+        let path = directory.path().join("credentials.db");
+
+        let id = {
+            let database =
+                Database::open_with_key(&path, [7u8; 32]).expect("failed to open encrypted db");
+            database
+                .create_item("OpenAI", None, "secret")
+                .expect("failed to create item")
+        };
+
+        let database =
+            Database::open_with_key(&path, [8u8; 32]).expect("failed to reopen with other key");
+        assert!(database.get_secret(&id).is_err());
+    }
+
+    #[test]
+    fn replacement_secrets_are_encrypted() {
+        let (database, _directory) = encrypted_test_database();
+        let id = database
+            .create_item("OpenAI", None, "old-secret")
+            .expect("failed to create item");
+
+        database
+            .update_credential(
+                Some(&format!("sqlite://{id}")),
+                "OpenAI",
+                "OpenAI",
+                Some("new-secret"),
+            )
+            .expect("failed to update credential");
+
+        assert_eq!(
+            database.get_secret(&id).expect("failed to read secret"),
+            Some("new-secret".to_string())
+        );
+        assert!(raw_secret(&database, &id).starts_with("enc:v1:"));
     }
 }

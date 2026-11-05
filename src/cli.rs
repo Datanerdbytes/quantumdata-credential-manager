@@ -1,6 +1,11 @@
+use std::collections::{HashMap, HashSet};
 use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
+use chrono::Local;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
@@ -16,12 +21,16 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 
+use crate::crypto::Key;
+use crate::env_import;
 use crate::models::Credential;
 use crate::notion::{NewCredential, archive_credential, create_credential, update_credential};
-use crate::secrets::{Database, SecretItem};
+use crate::rotation::{self, RotationAlert};
+use crate::secrets::{CLIPBOARD_CLEAR_SECONDS, CopyOutcome, Database, SecretItem};
 
-const MENU_ITEMS: [&str; 10] = [
+const MENU_ITEMS: [&str; 11] = [
     "Add Credential",
+    "Import .env File",
     "Search / Retrieve Credential",
     "List Credentials",
     "Update Credential",
@@ -48,6 +57,14 @@ const ADD_FIELDS: [&str; 9] = [
 ];
 
 const REQUIRED_ADD_FIELDS: usize = 1;
+
+const IMPORT_FIELDS: [&str; 5] = [
+    "Path to .env",
+    "Environment",
+    "Owner",
+    "Repository",
+    "Rotation Frequency",
+];
 
 const UPDATE_FIELDS: [&str; 10] = [
     "Name",
@@ -84,6 +101,7 @@ const SPLASH_COLORS: [Color; 4] = [
 ];
 const SPLASH_DURATION: Duration = Duration::from_millis(1500);
 const SPLASH_FRAME: Duration = Duration::from_millis(45);
+const ROTATION_NOTICE_META: &str = "rotation-notified";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -93,6 +111,8 @@ enum Screen {
     AddSecret,
     AddExisting,
     AddResult,
+    ImportEnv,
+    ImportResult,
     Search,
     List,
     Details,
@@ -101,6 +121,7 @@ enum Screen {
     UpdateSecret,
     Register,
     Rotate,
+    RotateSecret,
     SetNotionApiKey,
     DeleteNotionApiKey,
     DeleteCredential,
@@ -115,6 +136,8 @@ impl Screen {
             Screen::AddSecret => "ADD CREDENTIAL · SECRET",
             Screen::AddExisting => "SELECT CREDENTIAL",
             Screen::AddResult => "ADD CREDENTIAL · RESULT",
+            Screen::ImportEnv => "IMPORT .ENV FILE",
+            Screen::ImportResult => "IMPORT .ENV · RESULT",
             Screen::Search => "SEARCH / RETRIEVE",
             Screen::List => "CREDENTIALS",
             Screen::Details => "CREDENTIAL DETAILS",
@@ -123,6 +146,7 @@ impl Screen {
             Screen::UpdateSecret => "UPDATE CREDENTIAL · SECRET",
             Screen::Register => "REGISTER CREDENTIAL",
             Screen::Rotate => "ROTATE CREDENTIAL",
+            Screen::RotateSecret => "ROTATE CREDENTIAL · NEW SECRET",
             Screen::SetNotionApiKey => "STORE NOTION API KEY",
             Screen::DeleteNotionApiKey => "DELETE NOTION API KEY",
             Screen::DeleteCredential => "DELETE CREDENTIAL",
@@ -141,6 +165,10 @@ impl Screen {
             }
             Screen::AddExisting => "↑ / ↓ Navigate · Enter select · Esc Back",
             Screen::AddResult => "Esc Back to menu",
+            Screen::ImportEnv => {
+                "Type to edit · Tab / ↑ / ↓ switches fields · Enter starts the import · Esc to go back"
+            }
+            Screen::ImportResult => "Esc Back to menu",
             Screen::Search => "Type to filter · ↑ / ↓ select · Enter view details · Esc to go back",
             Screen::List => "↑ / ↓ Navigate · Enter View details · r Refresh · Esc Back",
             Screen::Details => "↑ / ↓ Scroll · c Copy secret · Esc Back · q Menu",
@@ -155,6 +183,9 @@ impl Screen {
                 "Type to edit · Tab / ↑ / ↓ switches fields · Enter to save · Esc to go back"
             }
             Screen::Rotate => "↑ / ↓ to choose · Enter to rotate · Esc to go back",
+            Screen::RotateSecret => {
+                "Type the new API secret (hidden) · Enter rotates · Esc to go back"
+            }
             Screen::SetNotionApiKey => "Type to edit · Enter to save · Esc to go back",
             Screen::DeleteNotionApiKey => {
                 "Type DELETE to confirm · Enter to delete · Esc to go back"
@@ -167,6 +198,7 @@ impl Screen {
         matches!(
             self,
             Screen::AddDetails
+                | Screen::ImportEnv
                 | Screen::Search
                 | Screen::UpdateDetails
                 | Screen::Register
@@ -192,6 +224,50 @@ enum PendingAction {
         original_reference: Option<String>,
         new_secret: Option<String>,
     },
+    RotateCredential {
+        page_id: Option<String>,
+        metadata: NewCredential,
+        original_name: String,
+        reference: Option<String>,
+        next_due: Option<String>,
+        new_secret: String,
+    },
+}
+
+enum LoadRequest {
+    Startup,
+    Screen(Screen),
+    Refresh {
+        name: Option<String>,
+        index: Option<usize>,
+        status: String,
+    },
+}
+
+struct PendingLoad {
+    receiver: Receiver<Result<Vec<Credential>, String>>,
+    request: LoadRequest,
+}
+
+struct PendingImport {
+    receiver: Receiver<Result<ImportOutcome, String>>,
+    path: String,
+}
+
+#[derive(Default)]
+struct ImportOutcome {
+    imported: Vec<String>,
+    skipped: Vec<String>,
+    failed: Vec<String>,
+}
+
+struct ImportDefaults {
+    environment: String,
+    owner: String,
+    repository: String,
+    rotation_frequency: String,
+    last_rotated: Option<String>,
+    next_rotation_due: Option<String>,
 }
 
 struct Form {
@@ -255,6 +331,9 @@ struct Dashboard {
     items: Vec<SecretItem>,
     item_selected: usize,
     result_lines: Vec<String>,
+    pending_load: Option<PendingLoad>,
+    pending_import: Option<PendingImport>,
+    notify_rotation: bool,
     database: Database,
 }
 
@@ -276,22 +355,251 @@ impl Dashboard {
             items: Vec::new(),
             item_selected: 0,
             result_lines: Vec::new(),
+            pending_load: None,
+            pending_import: None,
+            notify_rotation: false,
             database,
         }
     }
 
-    fn load_credentials(&mut self) -> bool {
-        match crate::notion::list_credentials(&self.database) {
-            Ok(credentials) => {
-                self.credentials = credentials;
-                self.selected_credential = 0;
-                self.search_selected = 0;
-                true
+    fn start_load(&mut self, request: LoadRequest) {
+        let path = self.database.path().to_path_buf();
+        let key = self.database.key();
+        let (sender, receiver) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let result = Database::open_with_optional_key(&path, key)
+                .and_then(|database| crate::notion::list_credentials(&database))
+                .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(result);
+        });
+
+        self.pending_load = Some(PendingLoad { receiver, request });
+        self.status = "Loading credentials from Notion…".to_string();
+    }
+
+    fn poll_background(&mut self) {
+        self.poll_load();
+        self.poll_import();
+    }
+
+    fn poll_load(&mut self) {
+        let Some(pending) = self.pending_load.take() else {
+            return;
+        };
+
+        match pending.receiver.try_recv() {
+            Ok(Ok(credentials)) => self.apply_loaded(pending.request, credentials),
+            Ok(Err(error)) => {
+                self.status = format!("Failed to load credentials: {error}");
             }
+            Err(TryRecvError::Empty) => {
+                self.pending_load = Some(pending);
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.status = "Credential loading stopped unexpectedly.".to_string();
+            }
+        }
+    }
+
+    fn has_pending_work(&self) -> bool {
+        self.pending_load.is_some() || self.pending_import.is_some()
+    }
+
+    fn poll_import(&mut self) {
+        let Some(pending) = self.pending_import.take() else {
+            return;
+        };
+
+        match pending.receiver.try_recv() {
+            Ok(result) => self.apply_import(pending.path, result),
+            Err(TryRecvError::Empty) => {
+                self.pending_import = Some(pending);
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.status = "Import stopped unexpectedly.".to_string();
+            }
+        }
+    }
+
+    fn apply_import(&mut self, path: String, result: std::result::Result<ImportOutcome, String>) {
+        let outcome = match result {
+            Ok(outcome) => outcome,
             Err(error) => {
-                self.status = format!("Failed to load credentials: {error:#}");
-                false
+                self.status = format!("Import failed: {error}");
+                return;
             }
+        };
+
+        let mut lines = vec![format!(
+            "Imported {} of {} credentials from {path}.",
+            outcome.imported.len(),
+            outcome.imported.len() + outcome.skipped.len() + outcome.failed.len()
+        )];
+
+        if !outcome.skipped.is_empty() {
+            lines.push(format!("Skipped {}", outcome.skipped.len()));
+        }
+        if !outcome.failed.is_empty() {
+            lines.push(format!("Failed {}", outcome.failed.len()));
+        }
+
+        if !outcome.imported.is_empty() {
+            lines.push(String::new());
+            lines.push("Imported".to_string());
+            for name in outcome.imported.iter().take(20) {
+                lines.push(format!("  {name}"));
+            }
+            if outcome.imported.len() > 20 {
+                lines.push(format!("  … and {} more", outcome.imported.len() - 20));
+            }
+        }
+
+        for (heading, entries) in [("Skipped", &outcome.skipped), ("Failed", &outcome.failed)] {
+            if entries.is_empty() {
+                continue;
+            }
+            lines.push(String::new());
+            lines.push(heading.to_string());
+            lines.extend(entries.iter().map(|entry| format!("  {entry}")));
+        }
+
+        self.result_lines = lines;
+        self.screen = Screen::ImportResult;
+        self.status = Screen::ImportResult.hint().to_string();
+
+        self.start_load(LoadRequest::Refresh {
+            name: None,
+            index: None,
+            status: format!(
+                "Imported {} credentials from {path}.",
+                outcome.imported.len()
+            ),
+        });
+    }
+
+    fn start_import(&mut self, path: String, defaults: ImportDefaults) {
+        let db_path = self.database.path().to_path_buf();
+        let key = self.database.key();
+        let env_path = expand_tilde(&path);
+        let display_path = path.clone();
+        let thread_path = display_path.clone();
+        let (sender, receiver) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let result = run_import(&db_path, key, &env_path, &thread_path, &defaults)
+                .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(result);
+        });
+
+        self.pending_import = Some(PendingImport {
+            receiver,
+            path: display_path,
+        });
+        self.status = format!("Importing credentials from {path}…");
+    }
+
+    fn apply_loaded(&mut self, request: LoadRequest, credentials: Vec<Credential>) {
+        self.credentials = credentials;
+        self.selected_credential = 0;
+        self.search_selected = 0;
+
+        match request {
+            LoadRequest::Startup => {}
+            LoadRequest::Screen(screen) => {
+                if self.screen == screen {
+                    self.finish_screen_load(screen);
+                }
+            }
+            LoadRequest::Refresh {
+                name,
+                index,
+                status,
+            } => {
+                if let Some(name) = name {
+                    if let Some(position) = self
+                        .credentials
+                        .iter()
+                        .position(|credential| credential.name == name)
+                    {
+                        self.selected_credential = position;
+                    }
+                }
+                if let Some(index) = index {
+                    self.selected_credential = index.min(self.credentials.len().saturating_sub(1));
+                }
+                self.status = if status.is_empty() {
+                    self.loaded_status()
+                } else {
+                    status
+                };
+            }
+        }
+
+        self.notify_rotation_due();
+    }
+
+    fn finish_screen_load(&mut self, screen: Screen) {
+        match screen {
+            Screen::List => self.status = self.loaded_status(),
+            Screen::Search => self.status = Screen::Search.hint().to_string(),
+            Screen::Rotate | Screen::Update | Screen::DeleteCredential => {
+                self.status = if self.credentials.is_empty() {
+                    match screen {
+                        Screen::Rotate => "No credentials available to rotate.",
+                        Screen::Update => "No credentials available to update.",
+                        _ => "No credentials available to delete.",
+                    }
+                    .to_string()
+                } else {
+                    screen.hint().to_string()
+                };
+            }
+            _ => {}
+        }
+    }
+
+    fn loaded_status(&self) -> String {
+        format!(
+            "Successfully loaded {} credentials from Notion.",
+            self.credentials.len()
+        )
+    }
+
+    fn rotation_alerts(&self) -> Vec<RotationAlert> {
+        rotation::due_alerts(&self.credentials, Local::now().date_naive())
+    }
+
+    fn notify_rotation_due(&mut self) {
+        if !self.notify_rotation {
+            return;
+        }
+
+        let alerts = self.rotation_alerts();
+        if alerts.is_empty() {
+            return;
+        }
+
+        let today = Local::now().date_naive();
+        let fingerprint = rotation::notification_fingerprint(&alerts, today);
+        match self.database.get_meta(ROTATION_NOTICE_META) {
+            Ok(Some(marker)) if marker == fingerprint => return,
+            Ok(_) => {}
+            Err(_) => return,
+        }
+
+        let body = applescript_escape(&rotation::notification_body(&alerts));
+        let script = format!(
+            "display notification \"{body}\" with title \"QuantumData\" subtitle \"Credential rotation\""
+        );
+
+        if Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .spawn()
+            .is_ok()
+        {
+            let _ = self.database.set_meta(ROTATION_NOTICE_META, &fingerprint);
         }
     }
 
@@ -307,6 +615,12 @@ impl Dashboard {
                 Form::new(&[])
             }
             Screen::AddDetails => Form::new(&ADD_FIELDS),
+            Screen::ImportEnv => {
+                self.result_lines.clear();
+                let mut form = Form::new(&IMPORT_FIELDS);
+                form.fields[1].1 = "Local".to_string();
+                form
+            }
             Screen::Search => Form::new(&["Query"]),
             Screen::Update => {
                 self.secret_input.clear();
@@ -320,30 +634,19 @@ impl Dashboard {
             _ => Form::new(&[]),
         };
 
-        let loaded = matches!(
+        if screen == Screen::Search {
+            self.search_selected = 0;
+        }
+
+        if matches!(
             screen,
             Screen::List
                 | Screen::Search
                 | Screen::Update
                 | Screen::Rotate
                 | Screen::DeleteCredential
-        ) && self.load_credentials();
-
-        if screen == Screen::Search {
-            self.search_selected = 0;
-        }
-
-        if screen == Screen::List && loaded {
-            self.status = format!(
-                "Successfully loaded {} credentials from Notion.",
-                self.credentials.len()
-            );
-        } else if screen == Screen::Rotate && loaded && self.credentials.is_empty() {
-            self.status = "No credentials available to rotate.".to_string();
-        } else if screen == Screen::Update && loaded && self.credentials.is_empty() {
-            self.status = "No credentials available to update.".to_string();
-        } else if screen == Screen::DeleteCredential && loaded && self.credentials.is_empty() {
-            self.status = "No credentials available to delete.".to_string();
+        ) {
+            self.start_load(LoadRequest::Screen(screen));
         }
     }
 
@@ -360,18 +663,7 @@ impl Dashboard {
         self.credentials
             .iter()
             .enumerate()
-            .filter(|(_, credential)| {
-                query.is_empty()
-                    || credential.name.to_lowercase().contains(&query)
-                    || credential
-                        .service
-                        .as_deref()
-                        .is_some_and(|service| service.to_lowercase().contains(&query))
-                    || credential
-                        .username
-                        .as_deref()
-                        .is_some_and(|username| username.to_lowercase().contains(&query))
-            })
+            .filter(|(_, credential)| credential_matches(credential, &query))
             .map(|(index, _)| index)
             .collect()
     }
@@ -429,6 +721,21 @@ impl Dashboard {
                 metadata,
                 original_name,
                 original_reference,
+                new_secret,
+            ),
+            PendingAction::RotateCredential {
+                page_id,
+                metadata,
+                original_name,
+                reference,
+                next_due,
+                new_secret,
+            } => self.apply_rotation(
+                page_id,
+                metadata,
+                original_name,
+                reference,
+                next_due,
                 new_secret,
             ),
         }
@@ -555,6 +862,23 @@ impl Dashboard {
         self.add_choice = 0;
     }
 
+    fn apply_rotation_defaults(&mut self) {
+        let last_rotated = rotation::parse_due_date(self.form.value(7))
+            .unwrap_or_else(|| Local::now().date_naive());
+
+        if self.form.value(7).trim().is_empty() {
+            self.form.fields[7].1 = last_rotated.format("%Y-%m-%d").to_string();
+        }
+
+        if self.form.value(8).trim().is_empty() {
+            if let Some(frequency) = rotation::parse_frequency(self.form.value(6)) {
+                if let Some(next) = rotation::add_frequency(last_rotated, frequency) {
+                    self.form.fields[8].1 = next.format("%Y-%m-%d").to_string();
+                }
+            }
+        }
+    }
+
     fn credential_from_form(&self, reference: String) -> NewCredential {
         NewCredential {
             name: self.form.value(0).trim().to_string(),
@@ -628,13 +952,77 @@ impl Dashboard {
         self.form = Form::new(&[]);
         self.secret_input.clear();
 
-        // load_credentials resets the selection, so restore it by name.
-        if self.load_credentials() {
-            if let Some(index) = self.credentials.iter().position(|item| item.name == name) {
-                self.selected_credential = index;
+        // Loading resets the selection, so restore it by name once the list arrives.
+        self.start_load(LoadRequest::Refresh {
+            name: Some(name.to_string()),
+            index: None,
+            status,
+        });
+    }
+
+    fn apply_rotation(
+        &mut self,
+        page_id: Option<String>,
+        metadata: NewCredential,
+        original_name: String,
+        reference: Option<String>,
+        next_due: Option<String>,
+        new_secret: String,
+    ) {
+        let name = metadata.name.clone();
+        let local = self.database.update_credential(
+            reference.as_deref(),
+            &original_name,
+            &name,
+            Some(&new_secret),
+        );
+
+        let notion = match page_id.as_deref() {
+            Some(page_id) => update_credential(page_id, &metadata, &self.database),
+            None => Ok(()),
+        };
+
+        let next_note = next_due
+            .as_deref()
+            .map(|due| format!(" Next rotation due {due}."))
+            .unwrap_or_default();
+
+        let status = match (page_id.is_some(), notion, local) {
+            (false, _, Ok(true)) => {
+                format!("Rotated '{name}' locally; it has no Notion page ID.{next_note}")
             }
-            self.status = status;
-        }
+            (false, _, Ok(false)) => {
+                format!("No local secret was found for '{name}'.{next_note}")
+            }
+            (false, _, Err(error)) => {
+                format!("Local rotation failed for '{name}': {error:#}")
+            }
+            (true, Ok(()), Ok(true)) => format!("Rotated '{name}'.{next_note}"),
+            (true, Ok(()), Ok(false)) => format!(
+                "Updated '{name}' in Notion, but no local secret was found to replace.{next_note}"
+            ),
+            (true, Ok(()), Err(error)) => {
+                format!("Updated '{name}' in Notion, but the local secret update failed: {error:#}")
+            }
+            (true, Err(error), Ok(true)) => {
+                format!("Rotated '{name}' locally, but the Notion update failed: {error:#}")
+            }
+            (true, Err(error), Ok(false)) => format!(
+                "Notion update failed for '{name}': {error:#}. No local secret was replaced."
+            ),
+            (true, Err(error), Err(local_error)) => format!(
+                "Notion update failed: {error:#}. Local update also failed: {local_error:#}"
+            ),
+        };
+
+        self.screen = Screen::Rotate;
+        self.form = Form::new(&[]);
+        self.secret_input.clear();
+        self.start_load(LoadRequest::Refresh {
+            name: Some(name),
+            index: None,
+            status,
+        });
     }
 
     fn copy_selected_secret(&mut self) {
@@ -655,9 +1043,14 @@ impl Dashboard {
         };
 
         match self.database.copy_secret_to_clipboard(reference) {
-            Ok(true) => self.status = "Secret copied to clipboard.".to_string(),
-            Ok(false) => {
-                self.status = "Clipboard unavailable. Secret printed to the terminal.".to_string()
+            Ok(CopyOutcome::Clipboard) => {
+                self.status = format!(
+                    "Secret copied to clipboard. It will be cleared in {CLIPBOARD_CLEAR_SECONDS} seconds."
+                )
+            }
+            Ok(CopyOutcome::Stdout) => {
+                self.status =
+                    "Clipboard unavailable. Secret printed once to the terminal.".to_string()
             }
             Err(error) => {
                 self.status = format!("Could not copy credential: {error:#}");
@@ -718,6 +1111,8 @@ impl Dashboard {
                     }
                 }
 
+                self.apply_rotation_defaults();
+
                 if self.add_choice == 0 {
                     self.screen = Screen::AddSecret;
                     self.status = Screen::AddSecret.hint().to_string();
@@ -734,6 +1129,35 @@ impl Dashboard {
                 self.pending_action = Some(PendingAction::CreateItem);
                 self.status = "Creating the credential and the Notion entry…".to_string();
             }
+            Screen::ImportEnv => {
+                if self.pending_import.is_some() {
+                    self.status = "An import is already running.".to_string();
+                    return;
+                }
+
+                let path = self.form.value(0).trim().to_string();
+                if path.is_empty() {
+                    self.status = "Path to .env is required.".to_string();
+                    return;
+                }
+
+                let today = Local::now().date_naive();
+                let next_due = rotation::parse_frequency(self.form.value(4))
+                    .and_then(|frequency| rotation::add_frequency(today, frequency))
+                    .map(|date| date.format("%Y-%m-%d").to_string());
+
+                let defaults = ImportDefaults {
+                    environment: self.form.value(1).trim().to_string(),
+                    owner: self.form.value(2).trim().to_string(),
+                    repository: self.form.value(3).trim().to_string(),
+                    rotation_frequency: self.form.value(4).trim().to_string(),
+                    last_rotated: Some(today.format("%Y-%m-%d").to_string()),
+                    next_rotation_due: next_due,
+                };
+
+                self.start_import(path, defaults);
+            }
+            Screen::ImportResult => {}
             Screen::AddExisting => {
                 if self.items.is_empty() {
                     self.status = "No credentials available to select.".to_string();
@@ -823,8 +1247,62 @@ impl Dashboard {
                     return;
                 }
                 let index = self.selected_credential.min(self.credentials.len() - 1);
-                let name = self.credentials[index].name.clone();
-                self.status = format!("Rotate '{name}': Notion/database are not connected yet.");
+                self.selected_credential = index;
+                self.secret_input.clear();
+                self.screen = Screen::RotateSecret;
+                self.status = Screen::RotateSecret.hint().to_string();
+            }
+            Screen::RotateSecret => {
+                if self.secret_input.is_empty() {
+                    self.status = "The new API secret is required.".to_string();
+                    return;
+                }
+
+                let Some(credential) = self.credentials.get(self.selected_credential) else {
+                    self.status = "No credential selected.".to_string();
+                    return;
+                };
+
+                let page_id = credential.id.clone().filter(|id| !id.trim().is_empty());
+                let name = credential.name.clone();
+                let reference = credential.credential_reference.clone();
+                let today = Local::now().date_naive();
+                let derived_due = rotation::parse_frequency(
+                    credential.rotation_frequency.as_deref().unwrap_or(""),
+                )
+                .and_then(|frequency| rotation::add_frequency(today, frequency))
+                .map(|date| date.format("%Y-%m-%d").to_string());
+                let next_due = derived_due.or_else(|| credential.next_rotation_due.clone());
+
+                let metadata = NewCredential {
+                    name: name.clone(),
+                    purpose: credential.purpose.clone().unwrap_or_default(),
+                    credential_reference: credential
+                        .credential_reference
+                        .clone()
+                        .unwrap_or_default(),
+                    environment_variable: credential
+                        .environment_variable
+                        .clone()
+                        .unwrap_or_default(),
+                    environment: credential.environment.clone().unwrap_or_default(),
+                    repository: credential.repository.clone().unwrap_or_default(),
+                    owner: credential.owner.clone().unwrap_or_default(),
+                    rotation_frequency: credential.rotation_frequency.clone().unwrap_or_default(),
+                    last_rotated: Some(today.format("%Y-%m-%d").to_string()),
+                    next_rotation_due: next_due.clone(),
+                };
+
+                let new_secret = std::mem::take(&mut self.secret_input);
+                self.pending_action = Some(PendingAction::RotateCredential {
+                    page_id,
+                    metadata,
+                    original_name: name.clone(),
+                    reference,
+                    next_due,
+                    new_secret,
+                });
+                self.status = format!("Rotating '{name}' and advancing its rotation dates…");
             }
             Screen::SetNotionApiKey => {
                 let key = self.form.value(0).trim();
@@ -899,15 +1377,14 @@ impl Dashboard {
                     Err(error) => (format!("Failed to delete '{name}': {error:#}"), false),
                 };
 
-                self.status = status;
-
                 if refresh {
-                    self.load_credentials();
-                    if self.credentials.is_empty() {
-                        self.selected_credential = 0;
-                    } else if index >= self.credentials.len() {
-                        self.selected_credential = self.credentials.len() - 1;
-                    }
+                    self.start_load(LoadRequest::Refresh {
+                        name: None,
+                        index: Some(index),
+                        status,
+                    });
+                } else {
+                    self.status = status;
                 }
             }
             Screen::Details => {}
@@ -945,6 +1422,11 @@ impl Dashboard {
                     self.status =
                         "Secret entry cancelled. The current secret was kept.".to_string();
                 }
+                Screen::RotateSecret => {
+                    self.secret_input.clear();
+                    self.screen = Screen::Rotate;
+                    self.status = "Rotation cancelled. The current secret was kept.".to_string();
+                }
                 Screen::UpdateDetails => {
                     self.secret_input.clear();
                     self.screen = Screen::Update;
@@ -977,7 +1459,9 @@ impl Dashboard {
                 Screen::Details => self.details_offset = self.details_offset.saturating_sub(1),
                 Screen::AddSecret => {}
                 Screen::UpdateSecret => {}
+                Screen::RotateSecret => {}
                 Screen::AddResult => {}
+                Screen::ImportResult => {}
                 _ if self.screen.is_form() => self.form.previous(),
                 _ => self.select_credential(-1),
             },
@@ -988,12 +1472,17 @@ impl Dashboard {
                 Screen::Details => self.details_offset += 1,
                 Screen::AddSecret => {}
                 Screen::UpdateSecret => {}
+                Screen::RotateSecret => {}
                 Screen::AddResult => {}
+                Screen::ImportResult => {}
                 _ if self.screen.is_form() => self.form.next(),
                 _ => self.select_credential(1),
             },
             KeyCode::Backspace => {
-                if matches!(self.screen, Screen::AddSecret | Screen::UpdateSecret) {
+                if matches!(
+                    self.screen,
+                    Screen::AddSecret | Screen::UpdateSecret | Screen::RotateSecret
+                ) {
                     self.secret_input.pop();
                 } else if self.screen.is_form() {
                     self.form.backspace();
@@ -1003,7 +1492,10 @@ impl Dashboard {
                 }
             }
             KeyCode::Char(character) => {
-                if matches!(self.screen, Screen::AddSecret | Screen::UpdateSecret) {
+                if matches!(
+                    self.screen,
+                    Screen::AddSecret | Screen::UpdateSecret | Screen::RotateSecret
+                ) {
                     self.secret_input.push(character);
                 } else if self.screen.is_form() {
                     self.form.push(character);
@@ -1011,12 +1503,11 @@ impl Dashboard {
                         self.search_selected = 0;
                     }
                 } else if self.screen == Screen::List && (character == 'r' || character == 'R') {
-                    if self.load_credentials() {
-                        self.status = format!(
-                            "Successfully loaded {} credentials from Notion.",
-                            self.credentials.len()
-                        );
-                    }
+                    self.start_load(LoadRequest::Refresh {
+                        name: None,
+                        index: None,
+                        status: String::new(),
+                    });
                 } else if self.screen == Screen::Details && (character == 'c' || character == 'C') {
                     self.pending_action = Some(PendingAction::CopySecret);
                 } else if character == 'q' || character == 'Q' {
@@ -1043,14 +1534,15 @@ impl Dashboard {
             KeyCode::Enter | KeyCode::Char(' ') => {
                 let screen = match self.selected {
                     0 => Screen::Add,
-                    1 => Screen::Search,
-                    2 => Screen::List,
-                    3 => Screen::Update,
-                    4 => Screen::Register,
-                    5 => Screen::Rotate,
-                    6 => Screen::SetNotionApiKey,
-                    7 => Screen::DeleteNotionApiKey,
-                    8 => Screen::DeleteCredential,
+                    1 => Screen::ImportEnv,
+                    2 => Screen::Search,
+                    3 => Screen::List,
+                    4 => Screen::Update,
+                    5 => Screen::Register,
+                    6 => Screen::Rotate,
+                    7 => Screen::SetNotionApiKey,
+                    8 => Screen::DeleteNotionApiKey,
+                    9 => Screen::DeleteCredential,
                     _ => return true,
                 };
                 self.open(screen);
@@ -1090,13 +1582,27 @@ impl Dashboard {
 
         match self.screen {
             Screen::Menu => {
+                let alerts = self.rotation_alerts();
+                let mut menu_area = layout[1];
+
+                if !alerts.is_empty() && menu_area.height >= 8 {
+                    let visible = if alerts.len() > 4 { 3 } else { alerts.len() };
+                    let alert_height = (visible as u16 + 2).min(menu_area.height - 4);
+                    let sections = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Length(alert_height), Constraint::Min(3)])
+                        .split(menu_area);
+                    render_rotation_panel(frame, sections[0], &alerts);
+                    menu_area = sections[1];
+                }
+
                 let items = MENU_ITEMS
                     .iter()
                     .map(|item| ListItem::new(format!("  {item}")))
                     .collect();
                 render_selectable_list(
                     frame,
-                    layout[1],
+                    menu_area,
                     self.screen.title(),
                     items,
                     self.selected,
@@ -1112,6 +1618,12 @@ impl Dashboard {
             Screen::AddSecret => self.render_secret(frame, layout[1]),
             Screen::AddExisting => self.render_add_existing(frame, layout[1]),
             Screen::AddResult => self.render_add_result(frame, layout[1]),
+            Screen::ImportEnv => self.render_form(
+                frame,
+                layout[1],
+                "Reads KEY=VALUE lines, stores each secret locally, then registers metadata in Notion.",
+            ),
+            Screen::ImportResult => self.render_add_result(frame, layout[1]),
             Screen::Search => self.render_search(frame, layout[1]),
             Screen::List => {
                 let items = credential_items(&self.credentials);
@@ -1160,6 +1672,7 @@ impl Dashboard {
                     Some("No credentials available to rotate."),
                 );
             }
+            Screen::RotateSecret => self.render_rotate_secret(frame, layout[1]),
             Screen::DeleteCredential => {
                 let items = credential_items(&self.credentials);
                 render_selectable_list(
@@ -1328,6 +1841,67 @@ impl Dashboard {
                 Style::default().fg(ACCENT),
             )),
         ]);
+
+        frame.render_widget(
+            Paragraph::new(lines)
+                .style(Style::default().bg(PANEL_BG))
+                .block(accent_panel(self.screen.title())),
+            area,
+        );
+    }
+
+    fn render_rotate_secret(&self, frame: &mut Frame, area: Rect) {
+        let credential = self.credentials.get(self.selected_credential);
+        let name = credential.map(|item| item.name.as_str()).unwrap_or("");
+        let frequency = credential
+            .and_then(|item| item.rotation_frequency.as_deref())
+            .unwrap_or("—");
+        let due = credential
+            .and_then(rotation::effective_due_date)
+            .map(|date| date.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "—".to_string());
+
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("  Credential  ", Style::default().fg(MUTED)),
+                Span::styled(
+                    name.to_string(),
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  Frequency   ", Style::default().fg(MUTED)),
+                Span::styled(frequency.to_string(), Style::default().fg(TEXT)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Current due ", Style::default().fg(MUTED)),
+                Span::styled(due, Style::default().fg(AMBER)),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  New secret  ", Style::default().fg(MUTED)),
+                Span::styled(
+                    "••••••••",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("▌", Style::default().fg(ACCENT)),
+                Span::styled("  (hidden)", Style::default().fg(MUTED)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Enter replaces the local secret and sets Last Rotated to today.",
+                Style::default().fg(MUTED),
+            )),
+            Line::from(Span::styled(
+                "  Next Rotation Due advances by the rotation frequency.",
+                Style::default().fg(MUTED),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Enter to rotate · Esc to cancel",
+                Style::default().fg(ACCENT),
+            )),
+        ];
 
         frame.render_widget(
             Paragraph::new(lines)
@@ -1544,7 +2118,8 @@ impl Dashboard {
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let settings = crate::config::Settings::load()?;
-    let database = Database::open(&settings.db_path)?;
+    let master_key = crate::crypto::load_master_key()?;
+    let database = Database::open_with_key(&settings.db_path, master_key)?;
 
     enable_raw_mode()?;
 
@@ -1695,29 +2270,155 @@ fn show_dashboard(
     database: Database,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut dashboard = Dashboard::new(database);
+    dashboard.notify_rotation = true;
+    dashboard.start_load(LoadRequest::Startup);
 
     loop {
         terminal.draw(|frame| dashboard.render(frame))?;
 
-        if let Event::Key(key) = event::read()? {
-            if key.kind == KeyEventKind::Release {
-                continue;
-            }
+        let timeout = if dashboard.has_pending_work() {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_millis(250)
+        };
 
-            if dashboard.handle_key(key.code) {
-                break;
-            }
+        if event::poll(timeout)? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Release {
+                    if dashboard.handle_key(key.code) {
+                        break;
+                    }
 
-            if let Some(action) = dashboard.take_pending_action() {
-                suspend_tui(terminal)?;
-                dashboard.perform_action(action);
-                resume_tui(terminal)?;
-                terminal.draw(|frame| dashboard.render(frame))?;
+                    if let Some(action) = dashboard.take_pending_action() {
+                        suspend_tui(terminal)?;
+                        dashboard.perform_action(action);
+                        resume_tui(terminal)?;
+                        terminal.draw(|frame| dashboard.render(frame))?;
+                    }
+                }
             }
         }
+
+        dashboard.poll_background();
     }
 
     Ok(())
+}
+
+fn credential_matches(credential: &Credential, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+
+    [
+        Some(credential.name.as_str()),
+        credential.service.as_deref(),
+        credential.username.as_deref(),
+        credential.owner.as_deref(),
+        credential.environment.as_deref(),
+        credential.repository.as_deref(),
+        credential.environment_variable.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| value.to_lowercase().contains(query))
+}
+
+fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+
+    PathBuf::from(path)
+}
+
+fn run_import(
+    db_path: &Path,
+    key: Option<Key>,
+    env_path: &Path,
+    display_path: &str,
+    defaults: &ImportDefaults,
+) -> std::result::Result<ImportOutcome, String> {
+    let contents = std::fs::read_to_string(env_path)
+        .map_err(|error| format!("Could not read {}: {error}", env_path.display()))?;
+    let parsed = env_import::parse(&contents);
+
+    let database =
+        Database::open_with_optional_key(db_path, key).map_err(|error| format!("{error:#}"))?;
+
+    let mut local_items: HashMap<String, String> = database
+        .list_items()
+        .map_err(|error| format!("{error:#}"))?
+        .into_iter()
+        .map(|item| (item.title.to_lowercase(), item.id))
+        .collect();
+
+    let registered = crate::notion::list_credentials(&database).unwrap_or_default();
+    let mut registered_names: HashSet<String> = registered
+        .iter()
+        .map(|credential| credential.name.to_lowercase())
+        .collect();
+    let mut registered_references: HashSet<String> = registered
+        .iter()
+        .filter_map(|credential| credential.credential_reference.clone())
+        .collect();
+
+    let mut outcome = ImportOutcome {
+        skipped: parsed.skipped,
+        ..ImportOutcome::default()
+    };
+
+    for entry in parsed.entries {
+        let key_lower = entry.key.to_lowercase();
+
+        let item_id = match local_items.get(&key_lower) {
+            Some(id) => id.clone(),
+            None => match database.create_item(&entry.key, None, &entry.value) {
+                Ok(id) => {
+                    local_items.insert(key_lower.clone(), id.clone());
+                    id
+                }
+                Err(error) => {
+                    outcome.failed.push(format!("{}: {error:#}", entry.key));
+                    continue;
+                }
+            },
+        };
+
+        let reference = format!("sqlite://{item_id}");
+        if registered_names.contains(&key_lower) || registered_references.contains(&reference) {
+            outcome
+                .skipped
+                .push(format!("{}: already registered in Notion", entry.key));
+            continue;
+        }
+
+        let credential = NewCredential {
+            name: entry.key.clone(),
+            purpose: format!("Imported from {display_path}"),
+            credential_reference: reference.clone(),
+            environment_variable: entry.key.clone(),
+            environment: defaults.environment.clone(),
+            repository: defaults.repository.clone(),
+            owner: defaults.owner.clone(),
+            rotation_frequency: defaults.rotation_frequency.clone(),
+            last_rotated: defaults.last_rotated.clone(),
+            next_rotation_due: defaults.next_rotation_due.clone(),
+        };
+
+        match create_credential(&credential, &database) {
+            Ok(()) => {
+                registered_names.insert(key_lower);
+                registered_references.insert(reference);
+                outcome.imported.push(entry.key);
+            }
+            Err(error) => outcome.failed.push(format!("{}: {error:#}", entry.key)),
+        }
+    }
+
+    Ok(outcome)
 }
 
 fn panel(title: &str) -> Block<'static> {
@@ -1945,6 +2646,49 @@ fn credential_item(credential: &Credential) -> ListItem<'static> {
             Style::default().fg(MUTED),
         ),
     ]))
+}
+
+fn render_rotation_panel(frame: &mut Frame, area: Rect, alerts: &[RotationAlert]) {
+    let visible = if alerts.len() > 4 { 3 } else { alerts.len() };
+
+    let mut lines: Vec<Line<'static>> = alerts
+        .iter()
+        .take(visible)
+        .map(|alert| {
+            let color = if alert.is_overdue() { DANGER } else { AMBER };
+            Line::from(vec![
+                Span::styled(
+                    format!("  {:<28}", truncate(&alert.name, 28)),
+                    Style::default().fg(TEXT),
+                ),
+                Span::styled(
+                    alert.label(),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+            ])
+        })
+        .collect();
+
+    if alerts.len() > visible {
+        lines.push(Line::from(Span::styled(
+            format!("  +{} more", alerts.len() - visible),
+            Style::default().fg(MUTED),
+        )));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(PANEL_BG))
+            .block(panel("ROTATION DUE")),
+        area,
+    );
+}
+
+fn applescript_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', " ")
 }
 
 fn form_lines(form: &Form, visible_rows: usize) -> Vec<Line<'static>> {
@@ -2180,6 +2924,74 @@ mod tests {
     }
 
     #[test]
+    fn search_covers_owner_environment_repository_and_variable_name() {
+        let (database, _file) = test_database();
+        let mut dashboard = Dashboard::new(database);
+        dashboard.credentials = vec![sample_credential()];
+        dashboard.screen = Screen::Search;
+        dashboard.form = Form::new(&["Query"]);
+
+        for query in ["owner", "local", "example/repo", "openai_api_key", "openai"] {
+            dashboard.form.fields[0].1 = query.to_string();
+            assert_eq!(
+                dashboard.search_indices(),
+                vec![0],
+                "query '{query}' should match"
+            );
+        }
+
+        dashboard.form.fields[0].1 = "databricks".to_string();
+        assert!(dashboard.search_indices().is_empty());
+    }
+
+    #[test]
+    fn env_import_stores_local_secrets_and_reports_each_outcome() {
+        let (database, _file) = test_database();
+        database
+            .create_item("ALREADY_STORED", None, "old")
+            .expect("failed to create existing item");
+
+        let directory = tempfile::tempdir().expect("failed to create temp directory");
+        let env_path = directory.path().join(".env");
+        std::fs::write(
+            &env_path,
+            "NEW_KEY=never-print-me\nALREADY_STORED=duplicate\nEMPTY=\n# comment\n",
+        )
+        .expect("failed to write env file");
+
+        let mut dashboard = Dashboard::new(database);
+        dashboard.open(Screen::ImportEnv);
+        dashboard.form.fields[0].1 = env_path.display().to_string();
+        dashboard.submit();
+
+        assert!(dashboard.pending_import.is_some());
+
+        for _ in 0..200 {
+            dashboard.poll_background();
+            if !dashboard.has_pending_work() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(!dashboard.has_pending_work());
+        assert_eq!(dashboard.screen, Screen::ImportResult);
+
+        let items = dashboard
+            .database
+            .list_items()
+            .expect("failed to list items");
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().any(|item| item.title == "NEW_KEY"));
+
+        let report = dashboard.result_lines.join("\n");
+        assert!(report.contains("Skipped 1"), "{report}");
+        assert!(report.contains("Failed 2"), "{report}");
+        assert!(report.contains("ALREADY_STORED:"), "{report}");
+        assert!(!report.contains("never-print-me"), "{report}");
+    }
+
+    #[test]
     fn date_validation_accepts_iso_shapes_only() {
         assert!(is_date_like("2026-01-01"));
         assert!(is_date_like("2026-01-01T10:00:00Z"));
@@ -2217,6 +3029,54 @@ mod tests {
         let credential = dashboard.credential_from_form("sqlite://vault/item/credential".into());
 
         assert_eq!(credential.last_rotated.as_deref(), Some("2026-01-01"));
+    }
+
+    #[test]
+    fn add_derives_rotation_dates_from_frequency() {
+        let mut dashboard = filled_dashboard();
+        dashboard.form.fields[6].1 = "Every 90 days".into();
+
+        dashboard.submit();
+
+        let today = Local::now().date_naive();
+        let expected = rotation::add_frequency(
+            today,
+            rotation::parse_frequency("Every 90 days").expect("frequency should parse"),
+        )
+        .expect("due date should be derived");
+
+        assert_eq!(
+            dashboard.form.value(7),
+            today.format("%Y-%m-%d").to_string()
+        );
+        assert_eq!(
+            dashboard.form.value(8),
+            expected.format("%Y-%m-%d").to_string()
+        );
+        assert_eq!(dashboard.screen, Screen::AddSecret);
+    }
+
+    #[test]
+    fn add_derives_rotation_dates_from_an_explicit_last_rotation() {
+        let mut dashboard = filled_dashboard();
+        dashboard.form.fields[6].1 = "Every 30 days".into();
+        dashboard.form.fields[7].1 = "2026-01-01".into();
+
+        dashboard.submit();
+
+        assert_eq!(dashboard.form.value(8), "2026-01-31");
+    }
+
+    #[test]
+    fn add_keeps_explicit_rotation_dates() {
+        let mut dashboard = filled_dashboard();
+        dashboard.form.fields[7].1 = "2026-01-01".into();
+        dashboard.form.fields[8].1 = "2026-04-01".into();
+
+        dashboard.submit();
+
+        assert_eq!(dashboard.form.value(7), "2026-01-01");
+        assert_eq!(dashboard.form.value(8), "2026-04-01");
     }
 
     #[test]
@@ -2361,5 +3221,135 @@ mod tests {
         assert_eq!(dashboard.screen, Screen::UpdateSecret);
         assert_eq!(dashboard.status, "'OpenAI' has no Notion page ID.");
         assert!(dashboard.pending_action.is_none());
+    }
+
+    #[test]
+    fn rotate_requires_a_new_secret() {
+        let mut dashboard = updatable_dashboard();
+        dashboard.screen = Screen::Rotate;
+
+        dashboard.submit();
+        assert_eq!(dashboard.screen, Screen::RotateSecret);
+
+        dashboard.submit();
+        assert_eq!(dashboard.screen, Screen::RotateSecret);
+        assert_eq!(dashboard.status, "The new API secret is required.");
+        assert!(dashboard.pending_action.is_none());
+    }
+
+    #[test]
+    fn rotate_stages_the_secret_and_advances_dates() {
+        let mut dashboard = updatable_dashboard();
+        dashboard.screen = Screen::Rotate;
+
+        dashboard.submit();
+        for character in "rotated".chars() {
+            dashboard.handle_key(KeyCode::Char(character));
+        }
+        assert_eq!(dashboard.secret_input, "rotated");
+        assert!(!dashboard.status.contains("rotated"));
+
+        dashboard.handle_key(KeyCode::Enter);
+
+        let today = Local::now().date_naive();
+        let today_text = today.format("%Y-%m-%d").to_string();
+        let expected_due = rotation::add_frequency(
+            today,
+            rotation::parse_frequency("Every 90 days").expect("frequency should parse"),
+        )
+        .expect("due date should be derived")
+        .format("%Y-%m-%d")
+        .to_string();
+
+        match dashboard.pending_action {
+            Some(PendingAction::RotateCredential {
+                ref page_id,
+                ref metadata,
+                ref next_due,
+                ref new_secret,
+                ..
+            }) => {
+                assert_eq!(page_id.as_deref(), Some("page-1"));
+                assert_eq!(new_secret, "rotated");
+                assert_eq!(metadata.last_rotated.as_deref(), Some(today_text.as_str()));
+                assert_eq!(
+                    metadata.next_rotation_due.as_deref(),
+                    Some(expected_due.as_str())
+                );
+                assert_eq!(next_due.as_deref(), Some(expected_due.as_str()));
+            }
+            ref other => panic!("unexpected action: {other:?}"),
+        }
+        assert!(dashboard.secret_input.is_empty());
+    }
+
+    #[test]
+    fn rotate_keeps_an_existing_due_date_without_a_frequency() {
+        let mut dashboard = updatable_dashboard();
+        dashboard.credentials[0].rotation_frequency = None;
+        dashboard.credentials[0].next_rotation_due = Some("2026-07-01".into());
+        dashboard.screen = Screen::Rotate;
+
+        dashboard.submit();
+        for character in "rotated".chars() {
+            dashboard.handle_key(KeyCode::Char(character));
+        }
+        dashboard.handle_key(KeyCode::Enter);
+
+        match dashboard.pending_action {
+            Some(PendingAction::RotateCredential {
+                ref metadata,
+                ref next_due,
+                ..
+            }) => {
+                assert_eq!(metadata.next_rotation_due.as_deref(), Some("2026-07-01"));
+                assert_eq!(next_due.as_deref(), Some("2026-07-01"));
+            }
+            ref other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancelling_rotation_discards_the_secret() {
+        let mut dashboard = updatable_dashboard();
+        dashboard.screen = Screen::Rotate;
+
+        dashboard.submit();
+        for character in "rotated".chars() {
+            dashboard.handle_key(KeyCode::Char(character));
+        }
+        dashboard.handle_key(KeyCode::Esc);
+
+        assert_eq!(dashboard.screen, Screen::Rotate);
+        assert!(dashboard.secret_input.is_empty());
+        assert!(dashboard.pending_action.is_none());
+    }
+
+    #[test]
+    fn escapes_notification_text_for_applescript() {
+        assert_eq!(applescript_escape("a \"b\" \\ c"), "a \\\"b\\\" \\\\ c");
+        assert_eq!(applescript_escape("line\nbreak"), "line break");
+    }
+
+    #[test]
+    fn rotation_alerts_come_from_due_dates() {
+        let (database, _file) = test_database();
+        let mut dashboard = Dashboard::new(database);
+
+        let mut overdue = sample_credential();
+        overdue.name = "Overdue".into();
+        overdue.next_rotation_due = Some("2020-01-01".into());
+
+        let mut derived = sample_credential();
+        derived.name = "Derived".into();
+        derived.next_rotation_due = None;
+        derived.last_rotated = Some("2020-01-01".into());
+        derived.rotation_frequency = Some("Every 30 days".into());
+
+        dashboard.credentials = vec![overdue, derived];
+        let alerts = dashboard.rotation_alerts();
+
+        assert_eq!(alerts.len(), 2);
+        assert!(alerts.iter().all(|alert| alert.is_overdue()));
     }
 }
