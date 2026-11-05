@@ -163,6 +163,22 @@ impl Database {
 
         Ok(())
     }
+
+    pub fn delete_item(&self, id: &str) -> Result<()> {
+        let rows_affected = self
+            .connection
+            .execute(
+                "DELETE FROM secrets WHERE id = ?",
+                params![id],
+            )
+            .context("Failed to delete credential from database")?;
+
+        if rows_affected == 0 {
+            return Err(anyhow!("No credential found with that ID."));
+        }
+
+        Ok(())
+    }
 }
 
 fn copy_to_clipboard(text: &str) -> Result<()> {

@@ -19,7 +19,7 @@ use crate::models::Credential;
 use crate::notion::{NewCredential, create_credential};
 use crate::secrets::{Database, SecretItem};
 
-const MENU_ITEMS: [&str; 9] = [
+const MENU_ITEMS: [&str; 10] = [
     "Add Credential",
     "Search / Retrieve Credential",
     "List Credentials",
@@ -28,6 +28,7 @@ const MENU_ITEMS: [&str; 9] = [
     "Rotate Credential",
     "Store Notion API Key",
     "Delete Notion API Key",
+    "Delete Credential",
     "Exit",
 ];
 
@@ -79,6 +80,7 @@ enum Screen {
     Rotate,
     SetNotionApiKey,
     DeleteNotionApiKey,
+    DeleteCredential,
 }
 
 impl Screen {
@@ -98,6 +100,7 @@ impl Screen {
             Screen::Rotate => "ROTATE CREDENTIAL",
             Screen::SetNotionApiKey => "STORE NOTION API KEY",
             Screen::DeleteNotionApiKey => "DELETE NOTION API KEY",
+            Screen::DeleteCredential => "DELETE CREDENTIAL",
         }
     }
 
@@ -128,6 +131,9 @@ impl Screen {
             }
             Screen::DeleteNotionApiKey => {
                 "Type DELETE to confirm · Enter to delete · Esc to go back"
+            }
+            Screen::DeleteCredential => {
+                "↑ / ↓ Navigate · Enter delete · Esc to go back"
             }
         }
     }
@@ -269,8 +275,11 @@ impl Dashboard {
             _ => Form::new(&[]),
         };
 
-        let loaded = matches!(screen, Screen::List | Screen::Search | Screen::Rotate)
-            && self.load_credentials();
+        let loaded = matches!(
+            screen,
+            Screen::List | Screen::Search | Screen::Rotate | Screen::DeleteCredential
+        )
+        && self.load_credentials();
 
         if screen == Screen::Search {
             self.search_selected = 0;
@@ -283,6 +292,8 @@ impl Dashboard {
             );
         } else if screen == Screen::Rotate && loaded && self.credentials.is_empty() {
             self.status = "No credentials available to rotate.".to_string();
+        } else if screen == Screen::DeleteCredential && loaded && self.credentials.is_empty() {
+            self.status = "No credentials available to delete.".to_string();
         }
     }
 
@@ -650,18 +661,47 @@ impl Dashboard {
                 }
             }
             Screen::DeleteNotionApiKey => {
-        let confirmation = self.form.value(0).trim();
-        if confirmation != "DELETE" {
-            self.status = "Type DELETE to confirm removal.".to_string();
+                let confirmation = self.form.value(0).trim();
+                if confirmation != "DELETE" {
+                    self.status = "Type DELETE to confirm removal.".to_string();
+                    return;
+                }
+                match self.database.delete_notion_api_key() {
+                    Ok(()) => {
+                        self.back_to_menu();
+                        self.status = "Notion API Key deleted from database.".to_string();
+                    }
+                    Err(error) => {
+                        self.status = format!("Failed to delete Notion API Key: {error:#}");
+                    }
+                }
+            }
+    Screen::DeleteCredential => {
+        if self.credentials.is_empty() {
+            self.status = "No credentials available to delete.".to_string();
             return;
         }
-        match self.database.delete_notion_api_key() {
+        let index = self.selected_credential.min(self.credentials.len() - 1);
+        let id = match &self.credentials[index].id {
+            Some(id) => id.clone(),
+            None => {
+                self.status = "Credential has no ID to delete.".to_string();
+                return;
+            }
+        };
+        let name = self.credentials[index].name.clone();
+        match self.database.delete_item(&id) {
             Ok(()) => {
-                self.back_to_menu();
-                self.status = "Notion API Key deleted from database.".to_string();
+                self.status = format!("Deleted '{name}' from database.");
+                self.load_credentials();
+                if self.credentials.is_empty() {
+                    self.selected_credential = 0;
+                } else if index >= self.credentials.len() {
+                    self.selected_credential = self.credentials.len() - 1;
+                }
             }
             Err(error) => {
-                self.status = format!("Failed to delete Notion API Key: {error:#}");
+                self.status = format!("Failed to delete '{name}': {error:#}");
             }
         }
     }
@@ -792,6 +832,7 @@ impl Dashboard {
                     5 => Screen::Rotate,
                     6 => Screen::SetNotionApiKey,
                     7 => Screen::DeleteNotionApiKey,
+                    8 => Screen::DeleteCredential,
                     _ => return true,
                 };
                 self.open(screen);
@@ -887,6 +928,17 @@ impl Dashboard {
                     items,
                     self.selected_credential,
                     Some("No credentials available to rotate."),
+                );
+            }
+            Screen::DeleteCredential => {
+                let items = credential_items(&self.credentials);
+                render_selectable_list(
+                    frame,
+                    layout[1],
+                    self.screen.title(),
+                    items,
+                    self.selected_credential,
+                    Some("No credentials available to delete."),
                 );
             }
             Screen::SetNotionApiKey => self.render_form(
